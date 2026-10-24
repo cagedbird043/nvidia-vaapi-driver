@@ -12,6 +12,8 @@
 #   VAAPI_DEVICE   render node (default: first NVIDIA render node)
 #   SIZE           frame size (default: 1920x1080)
 #   FRAMES         frame count (default: 60)
+#   RATE_FRAMES    frame count for CBR/VBR bitrate checks (default: 300); rate
+#                  control needs several seconds before the average settles
 #   MIN_PSNR       minimum average PSNR for encodes, dB (default: 35)
 
 set -u
@@ -29,6 +31,7 @@ fi
 
 SIZE=${SIZE:-1920x1080}
 FRAMES=${FRAMES:-60}
+RATE_FRAMES=${RATE_FRAMES:-300}
 MIN_PSNR=${MIN_PSNR:-35}
 
 export LIBVA_DRIVER_NAME=nvidia LIBVA_DRIVERS_PATH=$driver_dir
@@ -45,8 +48,8 @@ report() {
     case $1 in PASS) pass=$((pass + 1)) ;; FAIL) fail=$((fail + 1)) ;; *) skip=$((skip + 1)) ;; esac
 }
 
-src() { # src <pix_fmt> -> raw test pattern in $tmp/src-<pix_fmt>.nut
-    local out=$tmp/src-$1.nut
+src() { # src <pix_fmt> -> raw test pattern of $FRAMES frames
+    local out=$tmp/src-$1-$FRAMES.nut
     [ -f "$out" ] || ff -f lavfi -i "testsrc2=size=$SIZE:rate=30" -frames:v "$FRAMES" \
         -pix_fmt "$1" -c:v ffv1 "$out"
     echo "$out"
@@ -131,14 +134,15 @@ decode av1          'VAProfileAV1Profile0'   yuv420p     nv12 -c:v libsvtav1 -pr
 decode av1-10bit    'VAProfileAV1Profile0'   yuv420p10le p010 -c:v libsvtav1 -preset 10
 
 for rc in CQP CBR VBR; do
+    frames=$FRAMES
     case $rc in
         CQP) rcargs=(-rc_mode CQP -qp 24); EXPECT_KBPS= ;;
-        CBR) rcargs=(-rc_mode CBR -b:v 8M); EXPECT_KBPS=8000 ;;
-        VBR) rcargs=(-rc_mode VBR -b:v 4M -maxrate 8M); EXPECT_KBPS=4000 ;;
+        CBR) rcargs=(-rc_mode CBR -b:v 8M); EXPECT_KBPS=8000; frames=$RATE_FRAMES ;;
+        VBR) rcargs=(-rc_mode VBR -b:v 4M -maxrate 8M); EXPECT_KBPS=4000; frames=$RATE_FRAMES ;;
     esac
-    encode "h264-$rc"   'VAProfileH264High'    nv12 h264_vaapi "${rcargs[@]}"
-    encode "hevc-$rc"   'VAProfileHEVCMain '   nv12 hevc_vaapi "${rcargs[@]}"
-    encode "av1-$rc"    'VAProfileAV1Profile0' nv12 av1_vaapi  "${rcargs[@]}"
+    FRAMES=$frames encode "h264-$rc" 'VAProfileH264High'    nv12 h264_vaapi "${rcargs[@]}"
+    FRAMES=$frames encode "hevc-$rc" 'VAProfileHEVCMain '   nv12 hevc_vaapi "${rcargs[@]}"
+    FRAMES=$frames encode "av1-$rc"  'VAProfileAV1Profile0' nv12 av1_vaapi  "${rcargs[@]}"
 done
 EXPECT_KBPS=
 encode hevc-10bit-CQP   'VAProfileHEVCMain10'  p010 hevc_vaapi -profile:v main10 -rc_mode CQP -qp 24
