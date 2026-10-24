@@ -4583,10 +4583,15 @@ static bool initEncodeSession(NVContext *nvCtx) {
     initParams.version = nvencStructVersionForApi(NV_ENC_INITIALIZE_PARAMS_VER, negotiatedApiVersion);
     initParams.encodeGUID = encodeGuid;
     initParams.presetGUID = NV_ENC_PRESET_P4_GUID;
-    initParams.encodeWidth = nvCtx->width;
-    initParams.encodeHeight = nvCtx->height;
-    initParams.darWidth = nvCtx->width;
-    initParams.darHeight = nvCtx->height;
+    const bool useVisibleSize =
+        nvCtx->encodeVisibleWidth > 0 && nvCtx->encodeVisibleWidth <= nvCtx->width &&
+        nvCtx->encodeVisibleHeight > 0 && nvCtx->encodeVisibleHeight <= nvCtx->height;
+    const uint32_t encodeWidth = useVisibleSize ? nvCtx->encodeVisibleWidth : nvCtx->width;
+    const uint32_t encodeHeight = useVisibleSize ? nvCtx->encodeVisibleHeight : nvCtx->height;
+    initParams.encodeWidth = encodeWidth;
+    initParams.encodeHeight = encodeHeight;
+    initParams.darWidth = encodeWidth;
+    initParams.darHeight = encodeHeight;
     initParams.frameRateNum = nvCtx->encodeFrameRateNum > 0 ? nvCtx->encodeFrameRateNum : 30;
     initParams.frameRateDen = nvCtx->encodeFrameRateDen > 0 ? nvCtx->encodeFrameRateDen : 1;
     initParams.enableEncodeAsync = 0;
@@ -8869,6 +8874,12 @@ static VAStatus nvRenderPicture(
                     VAEncPictureParameterBufferAV1 *pic = (VAEncPictureParameterBufferAV1 *) buf->ptr;
                     nvCtx->encodeCodedBuffer = pic->coded_buf;
                     nvCtx->encodeForceIDR = pic->picture_flags.bits.frame_type == 0;
+                    // Chromium allocates AV1 input surfaces aligned to 64x64
+                    // superblocks and gives the real size only here.
+                    if (!nvCtx->encodeSessionInitialized) {
+                        nvCtx->encodeVisibleWidth = (uint32_t) pic->frame_width_minus_1 + 1;
+                        nvCtx->encodeVisibleHeight = (uint32_t) pic->frame_height_minus_1 + 1;
+                    }
                     if (nvCtx->encodeRateControl & VA_RC_CQP) {
                         maybeSetEncodeInitialQpFromHint(
                             nvCtx,

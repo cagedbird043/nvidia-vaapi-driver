@@ -377,6 +377,10 @@ typedef struct _NVContext
     uint32_t            encodeBitrate;
     uint32_t            encodeFrameRateNum;
     uint32_t            encodeFrameRateDen;
+    // Frame size to encode when the client allocates larger, aligned input
+    // surfaces; 0 means the surface size. NVENC reads the top-left region.
+    uint32_t            encodeVisibleWidth;
+    uint32_t            encodeVisibleHeight;
     uint32_t            encodeIntraPeriod;
     uint32_t            encodeIntraIDRPeriod;
     uint32_t            encodeIPPeriod;
