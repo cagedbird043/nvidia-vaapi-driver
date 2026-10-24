@@ -10,7 +10,7 @@ Changes on top of upstream:
 
 - NVENC encode for H.264, HEVC and AV1 through `VAEntrypointEncSlice` (PR #438 by ntoskrnl7).
 - VP9 decode is bit-exact with software decode: loop-filter deltas and segmentation data now persist across frames per decoder.
-- ffmpeg `av1_vaapi` opens and AV1 CBR/VBR hold the target bitrate (AV1 QP range is 0–255, not 0–51).
+- ffmpeg `av1_vaapi` opens, AV1 CBR/VBR hold the target bitrate (AV1 QP range is 0–255, not 0–51), and AV1 output can be written to Matroska/WebM (packed sequence headers are advertised, so ffmpeg writes the codec extradata).
 - Chrome WebCodecs and WebRTC H.264/AV1 encode work with stock Google Chrome: linear external frames are imported through CUDA buffer views (CUDA arrays are always block-linear and scrambled them), and in Chromium GPU processes the driver identifies itself so that Chrome passes the DRM format modifier (`DRM_PRIME_2`).
 - Chrome no longer kills its GPU process when WebRTC sends AV1 (`VAConfigAttribEncAV1Ext1` reported a segment block size of 0, which Chrome divides by).
 - `tests/hw-matrix.sh`: decode compared frame by frame with software decode, encode checked for frame count, PSNR and bitrate.
@@ -48,7 +48,7 @@ Chrome only reads the last `--enable-features`, so merge these names into any li
 
 - H.264、HEVC、AV1 的 NVENC 编码（`VAEntrypointEncSlice`，来自 ntoskrnl7 的 PR #438）。
 - VP9 解码与软件解码逐帧一致：环路滤波增量和分段数据按解码器跨帧保存。
-- ffmpeg 的 `av1_vaapi` 能打开，AV1 CBR/VBR 码率不再超标（AV1 的 QP 范围是 0–255，不是 0–51）。
+- ffmpeg 的 `av1_vaapi` 能打开，AV1 CBR/VBR 码率不再超标（AV1 的 QP 范围是 0–255，不是 0–51），AV1 能直接输出 mkv/webm（驱动声明支持 packed sequence header，ffmpeg 才会写 extradata）。
 - 原版 Google Chrome 的 WebCodecs 和 WebRTC 能用 H.264、AV1 硬件编码：线性的外部帧改用 CUDA buffer 视图导入（CUDA 数组总是 block-linear，会把画面读成条纹）；在 Chromium GPU 进程里驱动改用 Chrome 认得的厂商字符串，让 Chrome 传入带格式修饰符的 `DRM_PRIME_2`。
 - WebRTC 用 AV1 发送时 Chrome GPU 进程不再崩溃（`VAConfigAttribEncAV1Ext1` 原来上报的分段块大小是 0，Chrome 拿它做除数）。
 - `tests/hw-matrix.sh`：解码逐帧比对软件解码，编码检查帧数、PSNR 和码率。

@@ -2483,6 +2483,13 @@ static uint32_t encodeProfileToPackedHeaderMask(VAProfile profile) {
                VA_ENC_PACKED_HEADER_SLICE |
                VA_ENC_PACKED_HEADER_RAW_DATA;
     }
+    if (isAV1EncodeProfile(profile)) {
+        // FFmpeg writes its sequence header OBU into the codec extradata (av1C for
+        // Matroska/MP4) only when the driver accepts packed sequence headers. The
+        // per-IDR packed copy it then submits is ignored like any client header:
+        // NVENC emits its own sequence header in-band (repeatSeqHdr).
+        return VA_ENC_PACKED_HEADER_SEQUENCE;
+    }
     return VA_ENC_PACKED_HEADER_NONE;
 }
 

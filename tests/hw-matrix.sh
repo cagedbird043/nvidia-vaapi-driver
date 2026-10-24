@@ -88,9 +88,9 @@ encode() {
     if ! grep -q "$profile[[:space:]]*:[[:space:]]*VAEntrypointEncSlice" "$tmp/vainfo"; then
         report SKIP "encode $name" "$profile not advertised"; return
     fi
-    # mp4: matroska needs AV1 extradata at init, which av1_vaapi only produces
-    # with packed sequence headers (NVENC writes its own headers in band).
-    local out=$tmp/enc-$name.mp4 source
+    # mkv: matroska needs the codec extradata at init, so this also checks
+    # the global header path (AV1: packed sequence header support).
+    local out=$tmp/enc-$name.mkv source
     source=$(src "$upfmt")
     if ! ff -vaapi_device "$VAAPI_DEVICE" -i "$source" -vf "format=$upfmt,hwupload" \
         -c:v "$enc" "$@" "$out" 2>"$tmp/err"; then
