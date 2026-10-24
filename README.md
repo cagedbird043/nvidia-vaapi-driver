@@ -1,6 +1,65 @@
-# nvidia-vaapi-driver
+# nvidia-vaapi-driver (cagedbird043 fork)
 
-This is a VA-API implementation that uses NVDEC for decode and includes experimental NVENC slice encode support (H.264/HEVC/AV1). This implementation is primarily designed to be used by Firefox for accelerated decode of web content. Chrome support requires an external hotpatch runtime; see the [Chrome](#chrome) section.
+[English](#about-this-fork) · [中文](#关于这个-fork)
+
+## About this fork
+
+A maintained fork of [elFarto/nvidia-vaapi-driver](https://github.com/elFarto/nvidia-vaapi-driver): VA-API on NVDEC for decode and NVENC for encode. It follows upstream `master` instead of waiting for releases, carries the NVENC encode work from upstream PR #438, and adds fixes found by testing on real hardware. A change counts as done when `tests/hw-matrix.sh` and the browser checks below pass.
+
+Changes on top of upstream:
+
+- NVENC encode for H.264, HEVC and AV1 through `VAEntrypointEncSlice` (PR #438 by ntoskrnl7).
+- VP9 decode is bit-exact with software decode: loop-filter deltas and segmentation data now persist across frames per decoder.
+- ffmpeg `av1_vaapi` opens and AV1 CBR/VBR hold the target bitrate (AV1 QP range is 0–255, not 0–51).
+- Chrome WebCodecs and WebRTC H.264/AV1 encode work with stock Google Chrome: linear external frames are imported through CUDA buffer views (CUDA arrays are always block-linear and scrambled them), and in Chromium GPU processes the driver identifies itself so that Chrome passes the DRM format modifier (`DRM_PRIME_2`).
+- Chrome no longer kills its GPU process when WebRTC sends AV1 (`VAConfigAttribEncAV1Ext1` reported a segment block size of 0, which Chrome divides by).
+- `tests/hw-matrix.sh`: decode compared frame by frame with software decode, encode checked for frame count, PSNR and bitrate.
+
+### Tested
+
+RTX 4060 Laptop (Ada), NVIDIA open kernel modules 615.78.08, Arch Linux, KDE Plasma Wayland, direct backend.
+
+| Check | Result |
+|---|---|
+| `tests/hw-matrix.sh`, 1080p | 22/22: decode H.264, HEVC, HEVC 10-bit, VP8, VP9, VP9 10-bit, VP9 with segmentation, AV1, AV1 10-bit bit-exact; encode H.264/HEVC/AV1 in CQP, CBR and VBR, 10-bit and B-frames |
+| Chrome 156 `<video>` | H.264, HEVC, VP9, AV1 decoded on NVDEC |
+| Chrome 156 WebCodecs | H.264 encode on NVENC, output decodes to the source colours |
+| Chrome 156 WebRTC 720p loopback | H.264 and AV1 encoded on NVENC; H.264, VP9, AV1 decoded on NVDEC |
+| Firefox 158 `<video>` and WebRTC | H.264, VP9, AV1 decoded on NVDEC. Encode stays in software: Firefox picks the first ffmpeg hardware encoder it finds, which is not `*_vaapi` here |
+
+Upstream 0.0.18 hangs on VP8 decode on this machine; upstream `master` and this fork do not.
+
+### Chrome
+
+With the driver installed, start Chrome with:
+
+```sh
+google-chrome-stable \
+  --enable-features=AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,AcceleratedVideoEncoder
+```
+
+Chrome only reads the last `--enable-features`, so merge these names into any list your launcher already passes. On machines with more than one GPU, add `--render-node-override=/dev/dri/renderDXXX` with the NVIDIA render node. WebRTC uses the hardware encoder only from 720p up; lower resolutions stay in software by Chrome's choice.
+
+## 关于这个 fork
+
+[elFarto/nvidia-vaapi-driver](https://github.com/elFarto/nvidia-vaapi-driver) 的维护分支：解码走 NVDEC，编码走 NVENC。直接跟上游 `master`，不等发版；合入了上游 PR #438 的 NVENC 编码，再加上在真机上测出来的修复。改动以 `tests/hw-matrix.sh` 和上面的浏览器检查通过为准。
+
+相对上游的改动：
+
+- H.264、HEVC、AV1 的 NVENC 编码（`VAEntrypointEncSlice`，来自 ntoskrnl7 的 PR #438）。
+- VP9 解码与软件解码逐帧一致：环路滤波增量和分段数据按解码器跨帧保存。
+- ffmpeg 的 `av1_vaapi` 能打开，AV1 CBR/VBR 码率不再超标（AV1 的 QP 范围是 0–255，不是 0–51）。
+- 原版 Google Chrome 的 WebCodecs 和 WebRTC 能用 H.264、AV1 硬件编码：线性的外部帧改用 CUDA buffer 视图导入（CUDA 数组总是 block-linear，会把画面读成条纹）；在 Chromium GPU 进程里驱动改用 Chrome 认得的厂商字符串，让 Chrome 传入带格式修饰符的 `DRM_PRIME_2`。
+- WebRTC 用 AV1 发送时 Chrome GPU 进程不再崩溃（`VAConfigAttribEncAV1Ext1` 原来上报的分段块大小是 0，Chrome 拿它做除数）。
+- `tests/hw-matrix.sh`：解码逐帧比对软件解码，编码检查帧数、PSNR 和码率。
+
+测试环境和结果见上面的英文表格。上游 0.0.18 在这台机器上解 VP8 会卡死，上游 `master` 和本 fork 不会。
+
+Chrome 的启动参数同上。Chrome 只认最后一个 `--enable-features`，启动器里已有的要合并成一个。多显卡机器加上 `--render-node-override=/dev/dri/renderDXXX`，填 NVIDIA 的 render node。WebRTC 只在 720p 及以上用硬件编码，更低分辨率是 Chrome 自己选择用软件编码。
+
+---
+
+This is a VA-API implementation that uses NVDEC for decode and includes NVENC slice encode support (H.264/HEVC/AV1).
 
 # Table of contents
 
@@ -8,7 +67,7 @@ This is a VA-API implementation that uses NVDEC for decode and includes experime
 - [Table of contents](#table-of-contents)
 - [Codec Support](#codec-support)
 - [Installation](#installation)
-  - [Quick install from this fork](#quick-install-from-this-fork)
+  - [Quick install](#quick-install)
   - [Packaging status](#packaging-status)
   - [Building](#building)
   - [Removal](#removal)
@@ -79,10 +138,12 @@ To install and use `nvidia-vaapi-driver`, follow the steps in installation and c
 
 ## Quick install
 
-You can use the installer script to install the driver:
+On Arch Linux, install the AUR package `libva-nvidia-driver-cagedbird` (it replaces `libva-nvidia-driver`).
+
+Elsewhere, use the installer script:
 
 ```sh
-git clone https://github.com/elFarto/nvidia-vaapi-driver.git
+git clone https://github.com/cagedbird043/nvidia-vaapi-driver.git
 cd nvidia-vaapi-driver
 ./install.sh --deps --clean
 ```
@@ -247,45 +308,7 @@ If you're using the Snap version of Firefox, it will be unable to access the hos
 
 ## Chrome
 
-Stock Chrome does not use this driver on NVIDIA through the normal upstream
-Chrome path. For Chrome testing, use
-[`ntoskrnl7/chrome-vaapi-hotpatch`](https://github.com/ntoskrnl7/chrome-vaapi-hotpatch).
-
-That project runs copied or injected Chrome runtime paths without overwriting
-the system Chrome binary. With this driver's experimental `nvenc` branch, the
-hotpatch runtime can route official Google Chrome through VA-API paths for
-WebCodecs H.264 encode, H.265/HEVC encode, and HEVC decode verification.
-
-For NVIDIA, build and install this branch first, or point Chrome at the build
-directory:
-
-```bash
-LIBVA_DRIVERS_PATH=/path/to/nvidia-vaapi-driver/build \
-LIBVA_DRIVER_NAME=nvidia \
-CHROME_H265_VAAPI_DRIVER=nvidia \
-  /path/to/chrome-vaapi-hotpatch/run-h264-h265-vaapi.sh
-```
-
-For H.264-only encode testing, use the hotpatch project's
-`run-h264-vaapi.sh`. Use `vainfo` with the same `LIBVA_DRIVER_NAME` and
-`LIBVA_DRIVERS_PATH` environment to confirm the decode and encode entrypoints
-advertised by this driver on the target machine.
-
-The upstream Chromium-compatible single-buffer export path is also included.
-For Chrome / Chromium based browsers, set `LIBVA_DRIVER_NAME=nvidia` and start
-the browser with flags similar to:
-
-```sh
-LIBVA_DRIVER_NAME=nvidia google-chrome \
-  --enable-features=AcceleratedVideoDecodeLinuxGL,VaapiOnNvidiaGPUs \
-  --ignore-gpu-blocklist \
-  --use-gl=angle --use-angle=gl
-```
-
-On Wayland, also try `--ozone-platform=wayland` or
-`--ozone-platform-hint=auto`. Multi-plane YUV surfaces are exported as a
-single buffer with one DRM modifier, as required by Chromium's
-`vaapi_wrapper`.
+See [Chrome](#chrome) in the fork notes at the top. No hotpatch or Chrome rebuild is needed.
 
 ## MPV
 
