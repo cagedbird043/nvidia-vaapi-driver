@@ -90,10 +90,72 @@ static VAProcColorStandardType vp9ColorStandard(GstVp9ColorSpace colorSpace) {
     }
 }
 
+// Loop filter deltas and segmentation feature data persist across frames: a
+// frame header only carries the values it changes. VA-API passes none of them,
+// so they are tracked here per decoder (freed with the context's codecData).
+typedef struct {
+    int8_t refDeltas[GST_VP9_MAX_REF_LF_DELTAS];
+    int8_t modeDeltas[GST_VP9_MAX_MODE_LF_DELTAS];
+    bool segmentationAbsDelta;
+    GstVp9SegmentationInfoData segmentation[GST_VP9_MAX_SEGMENTS];
+} VP9Context;
+
+static void vp9SetupPastIndependence(VP9Context *vp9) {
+    static const int8_t defaultRefDeltas[GST_VP9_MAX_REF_LF_DELTAS] = { 1, 0, -1, -1 };
+
+    memcpy(vp9->refDeltas, defaultRefDeltas, sizeof(vp9->refDeltas));
+    memset(vp9->modeDeltas, 0, sizeof(vp9->modeDeltas));
+    vp9->segmentationAbsDelta = false;
+    memset(vp9->segmentation, 0, sizeof(vp9->segmentation));
+}
+
+static VP9Context *vp9Context(NVContext *ctx) {
+    if (ctx->codecData == NULL) {
+        VP9Context *vp9 = calloc(1, sizeof(VP9Context));
+        if (vp9 == NULL) {
+            return NULL;
+        }
+        vp9SetupPastIndependence(vp9);
+        ctx->codecData = vp9;
+    }
+    return ctx->codecData;
+}
+
+static void vp9UpdatePersistentState(VP9Context *vp9, const GstVp9FrameHdr *hdr) {
+    if (hdr->frame_type == GST_VP9_KEY_FRAME || hdr->intra_only || hdr->error_resilient_mode) {
+        vp9SetupPastIndependence(vp9);
+    }
+
+    const GstVp9LoopFilter *lf = &hdr->loopfilter;
+    if (lf->mode_ref_delta_enabled && lf->mode_ref_delta_update) {
+        for (int i = 0; i < GST_VP9_MAX_REF_LF_DELTAS; i++) {
+            if (lf->update_ref_deltas[i]) {
+                vp9->refDeltas[i] = lf->ref_deltas[i];
+            }
+        }
+        for (int i = 0; i < GST_VP9_MAX_MODE_LF_DELTAS; i++) {
+            if (lf->update_mode_deltas[i]) {
+                vp9->modeDeltas[i] = lf->mode_deltas[i];
+            }
+        }
+    }
+
+    const GstVp9SegmentationInfo *seg = &hdr->segmentation;
+    if (seg->enabled && seg->update_data) {
+        vp9->segmentationAbsDelta = seg->abs_delta;
+        memcpy(vp9->segmentation, seg->data, sizeof(vp9->segmentation));
+    }
+}
+
 static void parseExtraInfo(NVContext *ctx, void *buf, uint32_t size, CUVIDPICPARAMS *picParams) {
     //TODO a bit of a hack as we don't have per decoder init/deinit functions atm
     if (parser == NULL) {
         parser = gst_vp9_parser_new ();
+    }
+
+    VP9Context *vp9 = vp9Context(ctx);
+    if (vp9 == NULL) {
+        return;
     }
 
     //parse all the extra information that VA-API doesn't support, but NVDEC requires
@@ -101,26 +163,29 @@ static void parseExtraInfo(NVContext *ctx, void *buf, uint32_t size, CUVIDPICPAR
     GstVp9ParserResult res = gst_vp9_parser_parse_frame_header(parser, &hdr, buf, size);
 
     if (res == GST_VP9_PARSER_OK) {
-        for (int i = 0; i < 8; i++) {
-            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][0] = hdr.segmentation.data[i].alternate_quantizer_enabled;
-            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][1] = hdr.segmentation.data[i].alternate_loop_filter_enabled;
-            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][2] = hdr.segmentation.data[i].reference_frame_enabled;
-            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][3] = hdr.segmentation.data[i].reference_skip;
+        vp9UpdatePersistentState(vp9, &hdr);
 
-            picParams->CodecSpecific.vp9.segmentFeatureData[i][0] = hdr.segmentation.data[i].alternate_quantizer;
-            picParams->CodecSpecific.vp9.segmentFeatureData[i][1] = hdr.segmentation.data[i].alternate_loop_filter;
-            picParams->CodecSpecific.vp9.segmentFeatureData[i][2] = hdr.segmentation.data[i].reference_frame;
+        for (int i = 0; i < GST_VP9_MAX_SEGMENTS; i++) {
+            const GstVp9SegmentationInfoData *seg = &vp9->segmentation[i];
+            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][0] = seg->alternate_quantizer_enabled;
+            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][1] = seg->alternate_loop_filter_enabled;
+            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][2] = seg->reference_frame_enabled;
+            picParams->CodecSpecific.vp9.segmentFeatureEnable[i][3] = seg->reference_skip;
+
+            picParams->CodecSpecific.vp9.segmentFeatureData[i][0] = seg->alternate_quantizer;
+            picParams->CodecSpecific.vp9.segmentFeatureData[i][1] = seg->alternate_loop_filter;
+            picParams->CodecSpecific.vp9.segmentFeatureData[i][2] = seg->reference_frame;
             picParams->CodecSpecific.vp9.segmentFeatureData[i][3] = 0;
         }
 
-        picParams->CodecSpecific.vp9.segmentFeatureMode = hdr.segmentation.abs_delta;
+        picParams->CodecSpecific.vp9.segmentFeatureMode = vp9->segmentationAbsDelta;
 
         picParams->CodecSpecific.vp9.modeRefLfEnabled = hdr.loopfilter.mode_ref_delta_enabled;
-        for (int i = 0; i < 2; i++)
-            picParams->CodecSpecific.vp9.mbModeLfDelta[i] = hdr.loopfilter.mode_deltas[i];
+        for (int i = 0; i < GST_VP9_MAX_MODE_LF_DELTAS; i++)
+            picParams->CodecSpecific.vp9.mbModeLfDelta[i] = vp9->modeDeltas[i];
 
-        for (int i = 0; i < 4; i++)
-            picParams->CodecSpecific.vp9.mbRefLfDelta[i] = hdr.loopfilter.ref_deltas[i];
+        for (int i = 0; i < GST_VP9_MAX_REF_LF_DELTAS; i++)
+            picParams->CodecSpecific.vp9.mbRefLfDelta[i] = vp9->refDeltas[i];
 
         picParams->CodecSpecific.vp9.qpYAc = hdr.quant_indices.y_ac_qi;
         picParams->CodecSpecific.vp9.qpYDc = hdr.quant_indices.y_dc_delta;
