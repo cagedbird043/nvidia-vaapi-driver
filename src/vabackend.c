@@ -2523,6 +2523,18 @@ static uint32_t encodeHevcBlockSizesAttribValue(void) {
     return blockSizes.value;
 }
 
+static uint32_t encodeAv1Ext2AttribValue(void) {
+    VAConfigAttribValEncAV1Ext2 ext2 = {0};
+
+    // Only consulted by clients that write their own frame headers; NVENC picks
+    // tiling and transform mode itself.
+    ext2.bits.obu_size_bytes_minus1 = 3;
+    ext2.bits.tx_mode_support = 0x4; // TX_MODE_SELECT
+    ext2.bits.max_tile_num_minus1 = 63;
+
+    return ext2.value;
+}
+
 static bool checkNvencStatus(NVENCSTATUS status, const char *func) {
     if (status == NV_ENC_SUCCESS) {
         return true;
@@ -2609,14 +2621,12 @@ static NV_ENC_PARAMS_RC_MODE vaRateControlToNvencRateControl(uint32_t rateContro
     return NV_ENC_PARAMS_RC_CBR;
 }
 
-static uint32_t sanitizeQp(uint32_t qp) {
-    if (qp == 0) {
-        return 0;
-    }
-    if (qp > 51) {
-        return 51;
-    }
-    return qp;
+// VA-API and NVENC share the QP scale per codec: 0-51 for H.264/HEVC, the
+// 0-255 quantizer index for AV1.
+static uint32_t sanitizeQp(const NVContext *nvCtx, uint32_t qp) {
+    const uint32_t maxQp = isAV1EncodeProfile(nvCtx->profile) ? 255 : 51;
+
+    return qp > maxQp ? maxQp : qp;
 }
 
 static uint32_t clampQpToBounds(uint32_t qp, uint32_t minQp, uint32_t maxQp) {
@@ -2667,7 +2677,7 @@ static void maybeSetEncodeInitialQpFromHint(NVContext *nvCtx, int32_t qpHint, co
         return;
     }
 
-    const uint32_t qp = sanitizeQp((uint32_t) qpHint);
+    const uint32_t qp = sanitizeQp(nvCtx, (uint32_t) qpHint);
     if (qp == 0) {
         return;
     }
@@ -2681,9 +2691,9 @@ static void maybeSetEncodeInitialQpFromHint(NVContext *nvCtx, int32_t qpHint, co
 
 static void configureConstQpForEncode(NVContext *nvCtx, NV_ENC_RC_PARAMS *rcParams) {
     const uint32_t defaultQp = 26;
-    uint32_t qp = sanitizeQp(nvCtx->encodeInitialQp);
-    uint32_t minQp = sanitizeQp(nvCtx->encodeMinQp);
-    uint32_t maxQp = sanitizeQp(nvCtx->encodeMaxQp);
+    uint32_t qp = sanitizeQp(nvCtx, nvCtx->encodeInitialQp);
+    uint32_t minQp = sanitizeQp(nvCtx, nvCtx->encodeMinQp);
+    uint32_t maxQp = sanitizeQp(nvCtx, nvCtx->encodeMaxQp);
 
     if (qp == 0) {
         qp = defaultQp;
@@ -2709,9 +2719,9 @@ static void configureConstQpForEncode(NVContext *nvCtx, NV_ENC_RC_PARAMS *rcPara
 }
 
 static void configureQpBoundsForRateControl(NVContext *nvCtx, NV_ENC_RC_PARAMS *rcParams) {
-    uint32_t minQp = sanitizeQp(nvCtx->encodeMinQp);
-    uint32_t maxQp = sanitizeQp(nvCtx->encodeMaxQp);
-    uint32_t initialQp = sanitizeQp(nvCtx->encodeInitialQp);
+    uint32_t minQp = sanitizeQp(nvCtx, nvCtx->encodeMinQp);
+    uint32_t maxQp = sanitizeQp(nvCtx, nvCtx->encodeMaxQp);
+    uint32_t initialQp = sanitizeQp(nvCtx, nvCtx->encodeInitialQp);
 
     if (minQp != 0 && maxQp != 0 && minQp > maxQp) {
         maxQp = minQp;
@@ -5773,6 +5783,18 @@ static VAStatus nvGetConfigAttributes(
             case VAConfigAttribEncHEVCBlockSizes:
                 attrib_list[i].value = isHEVCEncodeProfile(profile)
                     ? encodeHevcBlockSizesAttribValue()
+                    : VA_ATTRIB_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncAV1:
+            case VAConfigAttribEncAV1Ext1:
+                // NVENC writes the sequence and frame headers itself (no packed
+                // headers), so no optional coding tool is negotiated through VA.
+                attrib_list[i].value = isAV1EncodeProfile(profile) ? 0 : VA_ATTRIB_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncAV1Ext2:
+                // ffmpeg refuses to open av1_vaapi without this attribute.
+                attrib_list[i].value = isAV1EncodeProfile(profile)
+                    ? encodeAv1Ext2AttribValue()
                     : VA_ATTRIB_NOT_SUPPORTED;
                 break;
             case VAConfigAttribMaxPictureWidth:
