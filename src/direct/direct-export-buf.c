@@ -3285,7 +3285,11 @@ static bool direct_importExternalSurfaceImpl(NVDriver *drv, NVSurface *surface, 
             isLinearModifier &&
             (import444PMode == DIRECT_444P_IMPORT_MODE_AUTO ||
              import444PMode == DIRECT_444P_IMPORT_MODE_BUFFER);
-        const bool useBufferDirectForLinear444 = usePitchWidthForLinear444;
+        // A CUDA array is always block-linear, so mapping pitch-linear memory
+        // as one scrambles it. Linear planes are read through buffer views.
+        const bool useBufferDirectForLinear444 =
+            isLinearModifier &&
+            (importFormat != NV_FORMAT_444P || usePitchWidthForLinear444);
         if (importFormat == NV_FORMAT_444P &&
             import444PMode == DIRECT_444P_IMPORT_MODE_BUFFER &&
             !isLinearModifier) {

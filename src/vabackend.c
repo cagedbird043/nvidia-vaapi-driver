@@ -11639,6 +11639,32 @@ static const struct VADriverVTableVPP vtable_vpp = {
     .vaQueryVideoProcPipelineCaps = &nvQueryVideoProcPipelineCaps,
 };
 
+// Chromium imports encoder input frames with the legacy DRM_PRIME descriptor,
+// which carries no format modifier, unless the vendor string marks the driver
+// as one it trusts with DRM_PRIME_2 (media/gpu/vaapi/vaapi_wrapper.cc,
+// VendorStringToImplementationType). NVIDIA GBM hands Chromium block-linear
+// NV12, so the legacy path would be read as linear and encoded as garbage.
+// The "Chromium fake libva driver" prefix only switches that import path.
+static bool isChromiumGpuProcess(void) {
+    char cmdline[4096];
+    const int fd = open("/proc/self/cmdline", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        return false;
+    }
+    const ssize_t len = read(fd, cmdline, sizeof(cmdline) - 1);
+    close(fd);
+    if (len <= 0) {
+        return false;
+    }
+    for (ssize_t i = 0; i < len; i++) {
+        if (cmdline[i] == '\0') {
+            cmdline[i] = ' ';
+        }
+    }
+    cmdline[len] = '\0';
+    return strstr(cmdline, " --type=gpu-process") != NULL;
+}
+
 __attribute__((visibility("default")))
 VAStatus __vaDriverInit_1_0(VADriverContextP ctx);
 
@@ -11748,10 +11774,15 @@ VAStatus __vaDriverInit_1_0(VADriverContextP ctx) {
     ctx->max_image_formats = ARRAY_SIZE(formatsInfo) - 1;
     ctx->max_subpic_formats = 1;
 
+    const bool chromium = isChromiumGpuProcess();
     if (backend == DIRECT) {
-        ctx->str_vendor = "VA-API NVDEC/NVENC driver [direct backend]";
+        ctx->str_vendor = chromium
+            ? "Chromium fake libva driver compatible: VA-API NVDEC/NVENC driver [direct backend]"
+            : "VA-API NVDEC/NVENC driver [direct backend]";
     } else if (backend == EGL) {
-        ctx->str_vendor = "VA-API NVDEC/NVENC driver [egl backend]";
+        ctx->str_vendor = chromium
+            ? "Chromium fake libva driver compatible: VA-API NVDEC/NVENC driver [egl backend]"
+            : "VA-API NVDEC/NVENC driver [egl backend]";
     }
 
     pthread_mutexattr_t attrib;
