@@ -2535,6 +2535,18 @@ static uint32_t encodeAv1Ext2AttribValue(void) {
     return ext2.value;
 }
 
+static uint32_t encodeAv1Ext1AttribValue(void) {
+    VAConfigAttribValEncAV1Ext1 ext1 = {0};
+
+    // va_enc_av1.h documents this field as a VA_SEGID_BLOCK_* bitmask, but
+    // Chromium (VaapiWrapper::GetMinAV1SegmentSize) reads it as the block size
+    // in pixels and divides by it. NVENC ignores client segmentation maps, so
+    // only that consumer matters; 0 makes Chromium's GPU process die on SIGFPE.
+    ext1.bits.min_segid_block_size_accepted = 32;
+
+    return ext1.value;
+}
+
 static bool checkNvencStatus(NVENCSTATUS status, const char *func) {
     if (status == NV_ENC_SUCCESS) {
         return true;
@@ -5786,10 +5798,14 @@ static VAStatus nvGetConfigAttributes(
                     : VA_ATTRIB_NOT_SUPPORTED;
                 break;
             case VAConfigAttribEncAV1:
-            case VAConfigAttribEncAV1Ext1:
                 // NVENC writes the sequence and frame headers itself (no packed
                 // headers), so no optional coding tool is negotiated through VA.
                 attrib_list[i].value = isAV1EncodeProfile(profile) ? 0 : VA_ATTRIB_NOT_SUPPORTED;
+                break;
+            case VAConfigAttribEncAV1Ext1:
+                attrib_list[i].value = isAV1EncodeProfile(profile)
+                    ? encodeAv1Ext1AttribValue()
+                    : VA_ATTRIB_NOT_SUPPORTED;
                 break;
             case VAConfigAttribEncAV1Ext2:
                 // ffmpeg refuses to open av1_vaapi without this attribute.
