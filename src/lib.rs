@@ -8,7 +8,7 @@ use std::{
     os::fd::IntoRawFd,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
-    sync::{mpsc, Arc, Mutex},
+    sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
 };
 use va::*;
@@ -33,18 +33,59 @@ struct Frame {
     data: Vec<Vec<u8>>,
     events: Vec<(bool, usize)>, // true: parameter group, false: data buffer
 }
+/// Outcome of work queued on a decoder thread. VA calls wait on it without holding the driver lock.
+struct Completion {
+    result: Mutex<Option<R>>,
+    ready: Condvar,
+}
+impl Completion {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { result: Mutex::new(None), ready: Condvar::new() })
+    }
+    fn done(result: R) -> Arc<Self> {
+        Arc::new(Self { result: Mutex::new(Some(result)), ready: Condvar::new() })
+    }
+    fn set(&self, result: R) {
+        if let Ok(mut slot) = self.result.lock() {
+            slot.get_or_insert(result);
+            self.ready.notify_all();
+        }
+    }
+    fn poll(&self) -> Option<R> {
+        *self.result.lock().ok()?
+    }
+    fn wait(&self) -> R {
+        let mut slot = self.result.lock().map_err(|_| FAILED)?;
+        loop {
+            if let Some(result) = *slot {
+                return result;
+            }
+            slot = self.ready.wait(slot).map_err(|_| FAILED)?;
+        }
+    }
+}
+/// The worker's handle on a Completion: dropping it unfinished (worker exit or panic) fails the work,
+/// so no VA call waits forever.
+struct Pending(Arc<Completion>);
+impl Pending {
+    fn finish(self, result: R) {
+        self.0.set(result);
+    }
+}
+impl Drop for Pending {
+    fn drop(&mut self) {
+        self.0.set(Err(FAILED));
+    }
+}
 enum Command {
-    Decode(
-        Frame,
-        Vec<VASliceParameterBufferH264>,
-        Vec<u8>,
-        mpsc::Sender<Result<(), String>>,
-    ),
-    Copy(u32, backend::Export, mpsc::Sender<Result<(), String>>),
+    Decode(Frame, Vec<VASliceParameterBufferH264>, Vec<u8>, Pending),
+    Copy(u32, backend::Export, Pending),
     Readback(u32, mpsc::Sender<Result<Vec<u8>, String>>),
     Release(u32),
     Quit,
 }
+/// Owns one context's RM decoder; executes commands in submission order, so a picture's decode
+/// precedes its copies, read-backs and release, and references precede the pictures using them.
 struct Worker {
     tx: mpsc::Sender<Command>,
     join: Option<thread::JoinHandle<()>>,
@@ -74,17 +115,21 @@ impl Worker {
                 };
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        Command::Decode(f, slices, data, reply) => {
-                            let _ = reply.send(decoder.decode(
+                        Command::Decode(f, slices, data, done) => {
+                            let result = decoder.decode(
                                 f.target,
                                 f.pic.as_ref().unwrap(),
                                 f.iq.as_ref().unwrap(),
                                 &slices,
                                 &data,
-                            ));
+                            );
+                            done.finish(result.map_err(|e| {
+                                eprintln!("rustnv: {e}");
+                                VA_STATUS_ERROR_DECODING_ERROR as VAStatus
+                            }));
                         }
-                        Command::Copy(id, output, reply) => {
-                            let _ = reply.send(decoder.copy_into(id, &output));
+                        Command::Copy(id, output, done) => {
+                            done.finish(gpu(decoder.copy_into(id, &output)));
                         }
                         Command::Readback(id, reply) => {
                             let _ = reply.send(decoder.readback(id));
@@ -109,32 +154,17 @@ impl Worker {
             }
         }
     }
-    /// Decode errors become VA_STATUS_ERROR_DECODING_ERROR; a dead worker is an operation failure.
-    fn decode(&self, f: Frame, slices: Vec<VASliceParameterBufferH264>, data: Vec<u8>) -> R {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Command::Decode(f, slices, data, tx))
-            .map_err(|_| FAILED)?;
-        match rx.recv() {
-            Ok(Ok(())) => Ok(()),
-            Ok(Err(e)) => {
-                eprintln!("rustnv: {e}");
-                Err(VA_STATUS_ERROR_DECODING_ERROR as VAStatus)
-            }
-            Err(_) => Err(FAILED),
-        }
+    /// Queues work whose outcome is reported through the returned Completion.
+    fn queue(&self, command: impl FnOnce(Pending) -> Command) -> Arc<Completion> {
+        let done = Completion::new();
+        // A dead worker drops the command, and with it the Pending, failing the work.
+        let _ = self.tx.send(command(Pending(done.clone())));
+        done
     }
     fn readback(&self, id: u32) -> R<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         self.tx
             .send(Command::Readback(id, tx))
-            .map_err(|_| FAILED)?;
-        gpu(rx.recv().map_err(|_| FAILED)?)
-    }
-    fn copy_into(&self, id: u32, output: backend::Export) -> R {
-        let (tx, rx) = mpsc::channel();
-        self.tx
-            .send(Command::Copy(id, output, tx))
             .map_err(|_| FAILED)?;
         gpu(rx.recv().map_err(|_| FAILED)?)
     }
@@ -230,10 +260,16 @@ struct Surface {
     owner: Option<u32>,
     worker: Option<Arc<Worker>>,
     extent: (u32, u32),
-    decoded: bool,
-    error: VAStatus,
+    /// Latest queued decode (None until the first EndPicture), and the copy into `output` after it.
+    decode: Option<Arc<Completion>>,
+    copy: Option<Arc<Completion>>,
     output: Option<backend::Export>,
     output_dirty: bool,
+}
+impl Surface {
+    fn pending(&self) -> Vec<Arc<Completion>> {
+        self.decode.iter().chain(&self.copy).cloned().collect()
+    }
 }
 struct Buffer {
     context: Option<u32>,
@@ -289,36 +325,23 @@ impl Driver {
             .get(&id)
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)
     }
-    fn readback(&self, id: u32) -> R<Vec<u8>> {
-        let s = self.surface(id)?;
-        if !s.decoded {
-            return Err(if s.error != 0 {
-                s.error
-            } else {
-                VA_STATUS_ERROR_INVALID_SURFACE as VAStatus
-            });
-        }
-        s.worker.as_ref().ok_or(FAILED)?.readback(id)
-    }
+    /// Queues the copy into the exported backing after the latest decode; vaSyncSurface waits for it.
     fn update_output(&mut self, id: u32) -> R {
-        let s = self.surface(id)?;
-        if !s.decoded || !s.output_dirty {
+        let s = self.surfaces.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
+        if s.decode.is_none() || !s.output_dirty {
             return Ok(());
         }
         let Some(output) = s.output.as_ref() else {
             return Ok(());
         };
         let output = gpu(output.try_clone())?;
-        let worker = s.worker.as_ref().ok_or(FAILED)?.clone();
-        worker.copy_into(id, output)?;
-        self.surfaces.get_mut(&id).unwrap().output_dirty = false;
+        let worker = s.worker.as_ref().ok_or(FAILED)?;
+        s.copy = Some(worker.queue(|done| Command::Copy(id, output, done)));
+        s.output_dirty = false;
         Ok(())
     }
     fn export_output(&mut self, id: u32) -> R<backend::Export> {
         let s = self.surface(id)?;
-        if s.error != 0 {
-            return Err(s.error);
-        }
         if s.output.is_none() {
             let (w, h) = (s.width, s.height);
             if self.output_worker.is_none() {
@@ -327,7 +350,7 @@ impl Driver {
             let output = self.output_worker.as_ref().unwrap().export(id, w, h)?;
             let s = self.surfaces.get_mut(&id).unwrap();
             s.output = Some(output);
-            s.output_dirty = s.decoded;
+            s.output_dirty = s.decode.is_some();
         }
         self.update_output(id)?;
         gpu(self.surface(id)?.output.as_ref().ok_or(FAILED)?.try_clone())
@@ -379,22 +402,42 @@ fn attribute(t: VAConfigAttribType) -> u32 {
     }
 }
 unsafe fn invoke(ctx: VADriverContextP, f: impl FnOnce(&mut Driver) -> R) -> VAStatus {
+    invoke_unlocked(ctx, |m| f(&mut *lock(m)?))
+}
+/// For calls that wait on GPU work: the closure takes the driver lock itself and must not hold it
+/// while waiting, so other threads keep decoding and exporting meanwhile.
+unsafe fn invoke_unlocked(ctx: VADriverContextP, f: impl FnOnce(&Mutex<Driver>) -> R) -> VAStatus {
     if ctx.is_null() || (*ctx).pDriverData.is_null() {
         return VA_STATUS_ERROR_INVALID_DISPLAY as VAStatus;
     }
-    match catch_unwind(AssertUnwindSafe(|| {
-        let m = &*((*ctx).pDriverData as *const Mutex<Driver>);
-        let mut d = m.lock().map_err(|_| FAILED)?;
-        f(&mut d)
-    })) {
+    match catch_unwind(AssertUnwindSafe(|| f(&*((*ctx).pDriverData as *const Mutex<Driver>)))) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => e,
         Err(_) => FAILED,
     }
 }
+fn lock(m: &Mutex<Driver>) -> R<MutexGuard<'_, Driver>> {
+    m.lock().map_err(|_| FAILED)
+}
+/// NV12 contents of a surface once its latest decode completed; waits without the driver lock.
+fn readback(m: &Mutex<Driver>, id: u32) -> R<Vec<u8>> {
+    let (worker, decode) = {
+        let d = lock(m)?;
+        let s = d.surface(id)?;
+        let invalid = VA_STATUS_ERROR_INVALID_SURFACE as VAStatus;
+        (s.worker.clone().ok_or(invalid)?, s.decode.clone().ok_or(invalid)?)
+    };
+    decode.wait()?;
+    worker.readback(id)
+}
 macro_rules! callback {
     ($name:ident($ctx:ident $(, $arg:ident : $ty:ty)*) |$d:ident| $body:block) => {
         unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { invoke($ctx, |$d| $body) }
+    };
+}
+macro_rules! callback_unlocked {
+    ($name:ident($ctx:ident $(, $arg:ident : $ty:ty)*) |$m:ident| $body:block) => {
+        unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { invoke_unlocked($ctx, |$m| $body) }
     };
 }
 callback!(query_profiles(ctx, list: *mut VAProfile, n: *mut i32) |_d| {
@@ -437,7 +480,7 @@ callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32,
             _ => return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus),
         }
     }
-    for i in 0..n as usize { let id = d.id()?; d.surfaces.insert(id, Surface { width: w, height: h, owner: None, worker: None, extent: (w,h), decoded: false, error: 0, output: None, output_dirty: false }); surfaces.add(i).write(id); } Ok(())
+    for i in 0..n as usize { let id = d.id()?; d.surfaces.insert(id, Surface { width: w, height: h, owner: None, worker: None, extent: (w,h), decode: None, copy: None, output: None, output_dirty: false }); surfaces.add(i).write(id); } Ok(())
 });
 unsafe extern "C" fn create_surfaces(
     ctx: VADriverContextP,
@@ -523,7 +566,7 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
     let s = d.surfaces.get_mut(&target).unwrap();
     // A surface moving to another decoder must not keep its picture alive in the previous one.
     if let Some(previous) = s.worker.replace(worker.clone()).filter(|p| !Arc::ptr_eq(p, &worker)) { let _ = previous.tx.send(Command::Release(target)); }
-    s.owner = Some(id); s.extent = extent; s.decoded = false; s.error = 0; s.output_dirty = true; Ok(())
+    s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.output_dirty = true; Ok(())
 });
 callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
     if d.context(id)?.frame.is_none() { return Err(INVALID); }
@@ -579,25 +622,36 @@ unsafe fn prepare(f: &mut Frame) -> R<(Vec<VASliceParameterBufferH264>, Vec<u8>)
     f.data.clear();
     Ok((slices, data))
 }
+// Queues the decode and returns; its outcome is reported by vaSyncSurface.
 callback!(end_picture(ctx, id: u32) |d| {
     let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     let mut f = c.frame.take().ok_or(INVALID)?;
     let (worker, target) = (c.worker.clone(), f.target);
-    // Every failure, including rejected parameters, is reported again by vaSyncSurface.
-    let result = prepare(&mut f).and_then(|(slices, data)| worker.decode(f, slices, data));
+    let (decode, status) = match prepare(&mut f) {
+        Ok((slices, data)) => (worker.queue(move |done| Command::Decode(f, slices, data, done)), Ok(())),
+        Err(e) => (Completion::done(Err(e)), Err(e)),
+    };
     let s = d.surfaces.get_mut(&target).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
-    s.decoded = result.is_ok(); s.error = result.err().unwrap_or(0);
-    result?;
-    if let Err(error) = d.update_output(target) { d.surfaces.get_mut(&target).unwrap().error = error; return Err(error); }
-    Ok(())
+    s.decode = Some(decode); s.copy = None;
+    status?;
+    d.update_output(target)
 });
-callback!(sync_surface(ctx, id: u32) |d| {
-    let s = d.surface(id)?; if d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == id)) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); } if s.error != 0 { return Err(s.error); } Ok(())
+fn busy(d: &Driver, id: u32) -> bool {
+    d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == id))
+}
+callback_unlocked!(sync_surface(ctx, id: u32) |m| {
+    let pending = { let d = lock(m)?; let s = d.surface(id)?; if busy(&d, id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); } s.pending() };
+    for work in pending { work.wait()?; }
+    Ok(())
 });
 unsafe extern "C" fn sync_surface2(ctx: VADriverContextP, id: u32, _timeout: u64) -> VAStatus {
     sync_surface(ctx, id)
 }
-callback!(query_status(ctx, id: u32, status: *mut VASurfaceStatus) |d| { let _s = d.surface(id)?; let busy = d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == id)); out(status, if busy { VASurfaceRendering } else { VASurfaceReady }) });
+callback!(query_status(ctx, id: u32, status: *mut VASurfaceStatus) |d| {
+    let s = d.surface(id)?;
+    let rendering = busy(d, id) || s.pending().iter().any(|work| work.poll().is_none());
+    out(status, if rendering { VASurfaceRendering } else { VASurfaceReady })
+});
 callback!(query_surface_error(ctx, id: u32, _status: VAStatus, _info: *mut *mut c_void) |d| { d.surface(id)?; Err(UNIMPL) });
 fn image_format() -> VAImageFormat {
     VAImageFormat {
@@ -642,22 +696,24 @@ callback!(query_images(ctx, formats: *mut VAImageFormat, n: *mut i32) |_d| { out
 callback!(create_image(ctx, format: *mut VAImageFormat, w: i32, h: i32, image: *mut VAImage) |d| {
     if format.is_null() || image.is_null() || w <= 0 || h <= 0 { return Err(INVALID); } if (*format).fourcc != NV12 { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); } let value = allocate_image(d, w as u32, h as u32)?; out(image, value)
 });
-callback!(derive_image(ctx, surface: u32, image: *mut VAImage) |d| {
-    if image.is_null() { return Err(INVALID); } let s = d.surface(surface)?; let (w,h) = s.extent; let bytes = d.readback(surface)?;
-    if bytes.len() != (w*h*3/2) as usize { return Err(FAILED); } let value = allocate_image(d,w,h)?;
+callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
+    if image.is_null() { return Err(INVALID); }
+    let (w,h) = lock(m)?.surface(surface)?.extent; let bytes = readback(m, surface)?;
+    if bytes.len() != (w*h*3/2) as usize { return Err(FAILED); }
+    let mut d = lock(m)?; let value = allocate_image(&mut d,w,h)?;
     d.buffers.get_mut(&value.buf).unwrap().bytes = bytes; out(image,value)
 });
 callback!(destroy_image(ctx, id: u32) |d| {
     let image = d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if d.buffer(image.buf)?.mapped { return Err(INVALID); }
     let image = d.images.remove(&id).unwrap(); d.buffers.remove(&image.buf); Ok(())
 });
-callback!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, id: u32) |d| {
-    let image = *d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; let s = d.surface(surface)?;
-    let (cw,ch) = s.extent;
+callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, id: u32) |m| {
+    let (image, (cw,ch)) = { let d = lock(m)?; (*d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?, d.surface(surface)?.extent) };
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
-    let (sw,sh) = (cw as usize,ch as usize); let b = d.buffer(image.buf)?; if b.mapped { return Err(INVALID); }
-    let bytes = d.readback(surface)?; if bytes.len() != sw*sh*3/2 { return Err(FAILED); }
-    let b = d.buffers.get_mut(&image.buf).unwrap();
+    let (sw,sh) = (cw as usize,ch as usize);
+    let bytes = readback(m, surface)?; if bytes.len() != sw*sh*3/2 { return Err(FAILED); }
+    let mut d = lock(m)?;
+    let b = d.buffers.get_mut(&image.buf).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if b.mapped { return Err(INVALID); }
     for row in 0..h as usize { let start = (y as usize+row)*sw+x as usize; let dest = row*w as usize; b.bytes[dest..dest+w as usize].copy_from_slice(&bytes[start..start+w as usize]); }
     for row in 0..h as usize/2 { let start = sw*sh+(y as usize/2+row)*sw+x as usize; let dest = (w*h) as usize+row*w as usize; b.bytes[dest..dest+w as usize].copy_from_slice(&bytes[start..start+w as usize]); } Ok(())
 });
