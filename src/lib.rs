@@ -56,13 +56,13 @@ fn gpu<T>(r: Result<T, String>) -> R<T> {
     })
 }
 impl Worker {
-    fn new(w: u32, h: u32) -> R<Self> {
+    fn new(pci: [u32; 4], w: u32, h: u32, surfaces: usize) -> R<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("rustnv-nvdec".into())
             .spawn(move || {
-                let mut decoder = match backend::Decoder::new(w, h) {
+                let mut decoder = match backend::Decoder::new(pci, w, h, surfaces) {
                     Ok(d) => {
                         let _ = ready_tx.send(Ok(()));
                         d
@@ -109,6 +109,21 @@ impl Worker {
             }
         }
     }
+    /// Decode errors become VA_STATUS_ERROR_DECODING_ERROR; a dead worker is an operation failure.
+    fn decode(&self, f: Frame, slices: Vec<VASliceParameterBufferH264>, data: Vec<u8>) -> R {
+        let (tx, rx) = mpsc::channel();
+        self.tx
+            .send(Command::Decode(f, slices, data, tx))
+            .map_err(|_| FAILED)?;
+        match rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => {
+                eprintln!("rustnv: {e}");
+                Err(VA_STATUS_ERROR_DECODING_ERROR as VAStatus)
+            }
+            Err(_) => Err(FAILED),
+        }
+    }
     fn readback(&self, id: u32) -> R<Vec<u8>> {
         let (tx, rx) = mpsc::channel();
         self.tx
@@ -144,13 +159,13 @@ struct OutputWorker {
     join: Option<thread::JoinHandle<()>>,
 }
 impl OutputWorker {
-    fn new() -> R<Self> {
+    fn new(pci: [u32; 4]) -> R<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("rustnv-output".into())
             .spawn(move || {
-                let mut pool = match backend::OutputPool::new() {
+                let mut pool = match backend::OutputPool::new(pci) {
                     Ok(pool) => {
                         let _ = ready_tx.send(Ok(()));
                         pool
@@ -229,6 +244,8 @@ struct Buffer {
     mapped: bool,
 }
 struct Driver {
+    /// The NVIDIA GPU behind the DRM device libva opened for this display.
+    pci: [u32; 4],
     next: u32,
     configs: HashMap<u32, VAProfile>,
     surfaces: HashMap<u32, Surface>,
@@ -238,8 +255,9 @@ struct Driver {
     output_worker: Option<OutputWorker>,
 }
 impl Driver {
-    fn new() -> Self {
+    fn new(pci: [u32; 4]) -> Self {
         Self {
+            pci,
             next: 1,
             configs: HashMap::new(),
             surfaces: HashMap::new(),
@@ -304,7 +322,7 @@ impl Driver {
         if s.output.is_none() {
             let (w, h) = (s.width, s.height);
             if self.output_worker.is_none() {
-                self.output_worker = Some(OutputWorker::new()?);
+                self.output_worker = Some(OutputWorker::new(self.pci)?);
             }
             let output = self.output_worker.as_ref().unwrap().export(id, w, h)?;
             let s = self.surfaces.get_mut(&id).unwrap();
@@ -457,7 +475,7 @@ callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: 
     if flags & !(VA_PROGRESSIVE as i32) != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     let targets: HashSet<u32> = array(targets, count(n)?)?.iter().copied().collect();
     for target in &targets { let s = d.surface(*target)?; if s.width < w as u32 || s.height < h as u32 { return Err(INVALID); } }
-    let worker = Arc::new(Worker::new(w as u32, h as u32)?); let key = d.id()?;
+    let worker = Arc::new(Worker::new(d.pci, w as u32, h as u32, targets.len())?); let key = d.id()?;
     d.contexts.insert(key, Context { worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
 });
 callback!(destroy_context(ctx, id: u32) |d| {
@@ -502,7 +520,10 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
     if s.owner.is_some_and(|owner| owner != id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
     let worker = c.worker.clone(); let extent = (c.width,c.height);
     d.contexts.get_mut(&id).unwrap().frame = Some(Frame { target, pic: None, iq: None, groups: Vec::new(), data: Vec::new(), events: Vec::new() });
-    let s = d.surfaces.get_mut(&target).unwrap(); s.owner = Some(id); s.worker = Some(worker); s.extent = extent; s.decoded = false; s.error = 0; s.output_dirty = true; Ok(())
+    let s = d.surfaces.get_mut(&target).unwrap();
+    // A surface moving to another decoder must not keep its picture alive in the previous one.
+    if let Some(previous) = s.worker.replace(worker.clone()).filter(|p| !Arc::ptr_eq(p, &worker)) { let _ = previous.tx.send(Command::Release(target)); }
+    s.owner = Some(id); s.extent = extent; s.decoded = false; s.error = 0; s.output_dirty = true; Ok(())
 });
 callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
     if d.context(id)?.frame.is_none() { return Err(INVALID); }
@@ -519,9 +540,8 @@ callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
         }
     } Ok(())
 });
-callback!(end_picture(ctx, id: u32) |d| {
-    let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
-    let mut f = c.frame.take().ok_or(INVALID)?;
+/// Gathers the frame's slices with offsets into one contiguous data buffer.
+unsafe fn prepare(f: &mut Frame) -> R<(Vec<VASliceParameterBufferH264>, Vec<u8>)> {
     let pic = f.pic.as_ref().ok_or(INVALID)?;
     if pic.CurrPic.picture_id != f.target || f.groups.is_empty() || f.data.is_empty() { return Err(INVALID); }
     if pic.bit_depth_luma_minus8 != 0 || pic.bit_depth_chroma_minus8 != 0 || pic.seq_fields.bits.chroma_format_idc() != 1 || pic.seq_fields.bits.frame_mbs_only_flag() == 0 || pic.pic_fields.bits.field_pic_flag() != 0 || pic.num_slice_groups_minus1 != 0 { return Err(VA_STATUS_ERROR_UNSUPPORTED_PROFILE as VAStatus); }
@@ -556,12 +576,18 @@ callback!(end_picture(ctx, id: u32) |d| {
             data.extend_from_slice(bytes); slices.push(s);
         }
     }
-    f.data.clear(); let target = f.target;
-    let (tx, rx) = mpsc::channel(); c.worker.tx.send(Command::Decode(f, slices, data, tx)).map_err(|_| FAILED)?;
-    let result = gpu(rx.recv().map_err(|_| FAILED)?);
+    f.data.clear();
+    Ok((slices, data))
+}
+callback!(end_picture(ctx, id: u32) |d| {
+    let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
+    let mut f = c.frame.take().ok_or(INVALID)?;
+    let (worker, target) = (c.worker.clone(), f.target);
+    // Every failure, including rejected parameters, is reported again by vaSyncSurface.
+    let result = prepare(&mut f).and_then(|(slices, data)| worker.decode(f, slices, data));
     let s = d.surfaces.get_mut(&target).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
-    s.decoded = result.is_ok(); s.error = if result.is_ok() { 0 } else { VA_STATUS_ERROR_DECODING_ERROR as VAStatus };
-    result.map_err(|_| VA_STATUS_ERROR_DECODING_ERROR as VAStatus)?;
+    s.decoded = result.is_ok(); s.error = result.err().unwrap_or(0);
+    result?;
     if let Err(error) = d.update_output(target) { d.surfaces.get_mut(&target).unwrap().error = error; return Err(error); }
     Ok(())
 });
@@ -797,11 +823,46 @@ unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
     }
 }
 
+/// PCI address of the NVIDIA GPU behind the DRM device libva opened for this display.
+/// Decoding on any other GPU would hand the application buffers its device cannot import.
+unsafe fn drm_pci(ctx: VADriverContextP) -> Result<[u32; 4], String> {
+    use std::os::unix::fs::MetadataExt;
+    let state = (*ctx).drm_state as *const drm_state;
+    if state.is_null() || (*state).fd < 0 {
+        return Err("the VA display has no DRM device".into());
+    }
+    let rdev = std::fs::metadata(format!("/proc/self/fd/{}", (*state).fd))
+        .map_err(|e| format!("DRM fd: {e}"))?
+        .rdev();
+    let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
+    let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
+    let device = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}/device"))
+        .map_err(|e| format!("DRM device {major}:{minor}: {e}"))?;
+    let driver = std::fs::canonicalize(device.join("driver")).map_err(|e| format!("{}: {e}", device.display()))?;
+    if driver.file_name().is_none_or(|n| n != "nvidia") {
+        return Err(format!("{} is driven by {}, not nvidia", device.display(), driver.display()));
+    }
+    let bdf = device.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let fields: Vec<u32> = bdf
+        .split([':', '.'])
+        .map(|f| u32::from_str_radix(f, 16))
+        .collect::<Result<_, _>>()
+        .map_err(|_| format!("unexpected PCI address {bdf:?}"))?;
+    fields.try_into().map_err(|_| format!("unexpected PCI address {bdf:?}"))
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
     if ctx.is_null() || (*ctx).vtable.is_null() || !(*ctx).pDriverData.is_null() {
         return INVALID;
     }
+    let pci = match drm_pci(ctx) {
+        Ok(pci) => pci,
+        Err(e) => {
+            eprintln!("rustnv: {e}");
+            return VA_STATUS_ERROR_INVALID_DISPLAY as VAStatus;
+        }
+    };
     match catch_unwind(AssertUnwindSafe(|| {
         let mut table: VADriverVTable = zeroed();
         table.vaTerminate = Some(terminate);
@@ -873,7 +934,7 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         (*ctx).max_subpic_formats = 1;
         (*ctx).max_display_attributes = 1;
         (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC H.264 driver\0".as_ptr().cast();
-        (*ctx).pDriverData = Box::into_raw(Box::new(Mutex::new(Driver::new()))).cast();
+        (*ctx).pDriverData = Box::into_raw(Box::new(Mutex::new(Driver::new(pci)))).cast();
         (*ctx).vtable.write(table);
     })) {
         Ok(()) => 0,

@@ -58,8 +58,8 @@ pub struct OutputPool {
     surfaces: HashMap<u32, OutputBacking>,
 }
 impl OutputPool {
-    pub fn new() -> Result<Self, String> {
-        let dev = video::VideoDevice::open().map_err(|e| e.to_string())?;
+    pub fn new(pci: [u32; 4]) -> Result<Self, String> {
+        let dev = video::VideoDevice::open_on(Some(pci)).map_err(|e| e.to_string())?;
         if !matches!(dev.info.nvdec_class, 0xc4b0 | 0xc7b0 | 0xc9b0) {
             return Err(
                 "VA export requires verified Turing/Ampere/Ada block-linear NV12 layout".into(),
@@ -390,12 +390,16 @@ pub struct Decoder {
     session: Session,
     state: Rc<RefCell<State>>,
     pictures: HashMap<u32, u64>,
+    /// Linear CPU-readable copy target, allocated on the first download and reused.
+    staging: Option<OutputAllocation>,
     width: u32,
     height: u32,
 }
 impl Decoder {
-    pub fn new(width: u32, height: u32) -> Result<Self, String> {
-        let dev = video::VideoDevice::open().map_err(|e| e.to_string())?;
+    /// `surfaces` is the number of VA render targets bound to the context (0 when the client binds
+    /// none up front). Each target retains at most one decoded picture and one more is being decoded.
+    pub fn new(pci: [u32; 4], width: u32, height: u32, surfaces: usize) -> Result<Self, String> {
+        let dev = video::VideoDevice::open_on(Some(pci)).map_err(|e| e.to_string())?;
         // This exact DRM modifier describes the verified pre-Blackwell NV12 layout.
         if !matches!(dev.info.nvdec_class, 0xc4b0 | 0xc7b0 | 0xc9b0) {
             return Err(
@@ -422,7 +426,12 @@ impl Decoder {
                 max_width: width,
                 max_height: height,
                 bit_depth: 8,
-                extra_output_slots: 32,
+                // The session pool holds dpb_size() + 2 surfaces before the extra slots.
+                extra_output_slots: if surfaces == 0 {
+                    32
+                } else {
+                    u32::try_from((surfaces + 1).saturating_sub(16 + 2)).map_err(|_| "too many surfaces")?
+                },
             },
             Box::new(codec),
         )
@@ -431,6 +440,7 @@ impl Decoder {
             session,
             state,
             pictures: HashMap::new(),
+            staging: None,
             width,
             height,
         })
@@ -567,10 +577,14 @@ impl Decoder {
         let pitch = self.width.next_multiple_of(2);
         let y = pitch as usize * self.height as usize;
         let size = y + pitch as usize * self.height.div_ceil(2) as usize;
-        let alloc = self
-            .session
-            .allocate_output(size.next_multiple_of(65536))
-            .map_err(|e| e.to_string())?;
+        if self.staging.is_none() {
+            let alloc = self
+                .session
+                .allocate_output(size.next_multiple_of(65536))
+                .map_err(|e| e.to_string())?;
+            self.staging = Some(alloc);
+        }
+        let alloc = self.staging.as_ref().unwrap();
         let t = Target {
             dmabuf_fd: [alloc.fd.as_raw_fd(), alloc.fd.as_raw_fd(), -1],
             offset: [0, y as u64, 0],
