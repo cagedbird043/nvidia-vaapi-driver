@@ -13,7 +13,7 @@ mod vp9;
 use crate::Format;
 use nvrm::video::{
     self,
-    session::{OutputAllocation, OutputAllocator, Session, SessionInfo, Target},
+    session::{OutputAllocation, OutputAllocator, OutputMapping, Session, SessionInfo, Target},
     SurfaceLayout,
 };
 use std::{
@@ -23,6 +23,10 @@ use std::{
     os::fd::{AsRawFd, OwnedFd},
 };
 
+/// Pitch granularity of a LINEAR copy-engine target.
+const STAGING_PITCH_ALIGN: usize = 4;
+/// Allocation granularity of the read-back staging buffer.
+const STAGING_SIZE_ALIGN: usize = 65536;
 const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6010;
 
 /// Codec family of a VA decoding context.
@@ -36,6 +40,15 @@ pub enum Codec {
     Mpeg4,
     Vc1,
     Vp8,
+}
+
+/// The luma-sample rectangle of a picture that a read-back copies.
+#[derive(Clone, Copy)]
+pub struct Rect {
+    pub x: u32,
+    pub y: u32,
+    pub w: u32,
+    pub h: u32,
 }
 
 /// One VA picture as submitted: raw parameter buffers, and complete slices (or tiles) whose data
@@ -188,8 +201,8 @@ pub struct Decoder {
     session: Session,
     front: Box<dyn Frontend>,
     pictures: HashMap<u32, u64>,
-    /// Linear CPU-readable copy target, allocated on the first download and reused.
-    staging: Option<OutputAllocation>,
+    /// Linear CPU-readable copy target and its mapping, created on the first download and reused.
+    staging: Option<(OutputAllocation, OutputMapping)>,
     width: u32,
     height: u32,
     format: Format,
@@ -293,31 +306,40 @@ impl Decoder {
             .copy_out_wait(id, &target)
             .map_err(|e| e.to_string())
     }
-    /// The picture's samples with rows packed at `width * bytes per sample`: the luma plane, then
-    /// the interleaved CbCr plane (4:2:0) or the Cb and Cr planes (4:4:4), see [`Format::packed`].
-    pub fn readback(&mut self, target: u32) -> Result<Vec<u8>, String> {
+    /// Copies the `rect` of the picture into `dest`, laid out as [`Format::packed`] for the rect's
+    /// size: the luma plane, then the interleaved CbCr plane (4:2:0) or the Cb and Cr planes
+    /// (4:4:4). The copy engine writes a persistent CPU-cached system-memory staging buffer, so the
+    /// CPU reads it at memory speed; each row goes straight into `dest`.
+    pub fn readback(&mut self, target: u32, rect: Rect, dest: &mut [u8]) -> Result<(), String> {
         let id = *self
             .pictures
             .get(&target)
             .ok_or("surface has not been decoded")?;
         let (w, rows) = (self.width as usize, self.height as usize);
         let bps = self.format.bytes_per_sample() as usize;
-        // LINEAR copy targets need a 4-byte-aligned pitch; the result is repacked to `width`.
-        let pitch = (w * bps).next_multiple_of(4);
+        let (rx, ry, rw, rh) = (rect.x as usize, rect.y as usize, rect.w as usize, rect.h as usize);
+        if rx + rw > w || ry + rh > rows || rx % 2 != 0 || ry % 2 != 0 || rw % 2 != 0 || rh % 2 != 0 {
+            return Err("read-back rectangle outside the surface".into());
+        }
+        let (dpitch, doffsets, dsize) = self.format.packed(rect.w, rect.h);
+        let dest = dest.get_mut(..dsize).ok_or("read-back destination is too small")?;
+        // LINEAR copy targets need a 4-byte-aligned pitch.
+        let pitch = (w * bps).next_multiple_of(STAGING_PITCH_ALIGN);
         let plane = pitch * rows;
-        let chroma_rows = if self.format.chroma_444 { rows } else { rows.div_ceil(2) };
-        let size = plane + pitch * chroma_rows * (self.format.planes() - 1);
+        let chroma_rows = self.format.chroma_rows(self.height) as usize;
+        let chroma_plane = pitch * chroma_rows;
+        let planes = self.format.planes();
         if self.staging.is_none() {
+            let size = plane + chroma_plane * (planes - 1);
             let alloc = self
                 .session
-                .allocate_output(size.next_multiple_of(65536))
+                .allocate_readback(size.next_multiple_of(STAGING_SIZE_ALIGN))
                 .map_err(|e| e.to_string())?;
-            self.staging = Some(alloc);
+            let map = alloc.map().map_err(|e| e.to_string())?;
+            self.staging = Some((alloc, map));
         }
-        let alloc = self.staging.as_ref().unwrap();
+        let (alloc, map) = self.staging.as_ref().unwrap();
         let fd = alloc.fd.as_raw_fd();
-        let planes = self.format.planes();
-        let chroma_plane = pitch * chroma_rows;
         let t = Target {
             dmabuf_fd: [fd, fd, if planes == 3 { fd } else { -1 }],
             offset: [0, plane as u64, (plane + chroma_plane) as u64],
@@ -331,18 +353,22 @@ impl Decoder {
         self.session
             .copy_out_wait(id, &t)
             .map_err(|e| e.to_string())?;
-        let map = alloc.map().map_err(|e| e.to_string())?;
-        let line = w * bps;
-        let mut packed = vec![0; self.format.packed(self.width, self.height).2];
-        let mut dest = packed.chunks_exact_mut(line);
-        let planes = [(0, rows), (plane, chroma_rows), (plane + chroma_plane, chroma_rows)];
-        for &(start, count) in &planes[..self.format.planes()] {
+        let src = map.bytes().map_err(|e| e.to_string())?;
+        let row_bytes = rw * bps;
+        // (staging plane start, destination plane start, rows, first source row)
+        let spans = [
+            (0, doffsets[0] as usize, rh, ry),
+            (plane, doffsets[1] as usize, self.format.chroma_rows(rect.h) as usize, if self.format.chroma_444 { ry } else { ry / 2 }),
+            (plane + chroma_plane, doffsets[2] as usize, rh, ry),
+        ];
+        for &(start, base, count, first) in &spans[..planes] {
             for row in 0..count {
-                let d = dest.next().ok_or("packed read-back is shorter than its planes")?;
-                map.read_bytes(start + row * pitch, d).map_err(|e| e.to_string())?;
+                let from = start + (first + row) * pitch + rx * bps;
+                let to = base + row * dpitch as usize;
+                dest[to..to + row_bytes].copy_from_slice(&src[from..from + row_bytes]);
             }
         }
-        Ok(packed)
+        Ok(())
     }
     pub fn release_surface(&mut self, target: u32) {
         if let Some(id) = self.pictures.remove(&target) {

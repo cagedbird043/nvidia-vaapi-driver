@@ -269,10 +269,15 @@ impl Drop for Pending {
         self.0.set(Err(FAILED));
     }
 }
+/// A caller-owned byte range the worker fills. The caller blocks on the reply, keeping the
+/// range alive and otherwise untouched, until the worker is done with it.
+struct Destination(*mut u8, usize);
+// SAFETY: see above; the range is accessed by one thread at a time.
+unsafe impl Send for Destination {}
 enum Command {
     Decode(backend::Picture, Pending),
     Copy(u32, backend::Export, Pending),
-    Readback(u32, mpsc::Sender<Result<Vec<u8>, String>>),
+    Readback(u32, backend::Rect, Destination, mpsc::Sender<Result<(), String>>),
     Release(u32),
     Quit,
 }
@@ -317,8 +322,10 @@ impl Worker {
                         Command::Copy(id, output, done) => {
                             done.finish(gpu(decoder.copy_into(id, &output)));
                         }
-                        Command::Readback(id, reply) => {
-                            let _ = reply.send(decoder.readback(id));
+                        Command::Readback(id, rect, dest, reply) => {
+                            // SAFETY: `Destination` documents the caller keeps the range valid.
+                            let dest = unsafe { std::slice::from_raw_parts_mut(dest.0, dest.1) };
+                            let _ = reply.send(decoder.readback(id, rect, dest));
                         }
                         Command::Release(id) => decoder.release_surface(id),
                         Command::Quit => break,
@@ -347,10 +354,10 @@ impl Worker {
         let _ = self.tx.send(command(Pending(done.clone())));
         done
     }
-    fn readback(&self, id: u32) -> R<Vec<u8>> {
+    fn readback(&self, id: u32, rect: backend::Rect, dest: &mut [u8]) -> R<()> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(Command::Readback(id, tx))
+            .send(Command::Readback(id, rect, Destination(dest.as_mut_ptr(), dest.len()), tx))
             .map_err(|_| FAILED)?;
         gpu(rx.recv().map_err(|_| FAILED)?)
     }
@@ -662,16 +669,21 @@ unsafe fn invoke_unlocked(ctx: VADriverContextP, f: impl FnOnce(&Mutex<Driver>) 
 fn lock(m: &Mutex<Driver>) -> R<MutexGuard<'_, Driver>> {
     m.lock().map_err(|_| FAILED)
 }
-/// Packed contents (see [`Format::packed`]) of a surface once its latest decode completed; waits without the driver lock.
-fn readback(m: &Mutex<Driver>, id: u32) -> R<Vec<u8>> {
-    let (worker, decode) = {
-        let d = lock(m)?;
-        let s = d.surface(id)?;
-        let invalid = VA_STATUS_ERROR_INVALID_SURFACE as VAStatus;
-        (s.worker.clone().ok_or(invalid)?, s.decode.clone().ok_or(invalid)?)
-    };
-    decode.wait()?;
-    worker.readback(id)
+/// Fills `dest` with the `rect` of a surface (see [`Format::packed`] for the layout) once its
+/// latest decode completed. Waits for the decode without the driver lock; `dest` is borrowed from
+/// the driver, so the caller holds the lock for the short copy.
+fn readback(d: &mut MutexGuard<'_, Driver>, id: u32, rect: backend::Rect, buffer: u32) -> R<()> {
+    let s = d.surface(id)?;
+    let invalid = VA_STATUS_ERROR_INVALID_SURFACE as VAStatus;
+    let worker = s.worker.clone().ok_or(invalid)?;
+    let dest = d.buffers.get_mut(&buffer).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?;
+    if dest.mapped { return Err(INVALID); }
+    worker.readback(id, rect, &mut dest.bytes)
+}
+/// The latest decode of a surface; waiting on it needs no driver lock.
+fn decoded(m: &Mutex<Driver>, id: u32) -> R<Arc<Completion>> {
+    let d = lock(m)?;
+    d.surface(id)?.decode.clone().ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)
 }
 macro_rules! callback {
     ($name:ident($ctx:ident $(, $arg:ident : $ty:ty)*) |$d:ident| $body:block) => {
@@ -1163,10 +1175,13 @@ callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
     if image.is_null() { return Err(INVALID); }
     if let Some(value) = encode::derive_input_image(&mut *lock(m)?, surface)? { return out(image, value); }
     let (w, h, fourcc) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc) };
-    let bytes = readback(m, surface)?;
-    if bytes.len() != packed_format(fourcc).packed(w, h).2 { return Err(FAILED); }
-    let mut d = lock(m)?; let value = allocate_image(&mut d, w, h, fourcc)?;
-    d.buffers.get_mut(&value.buf).unwrap().bytes = bytes; out(image, value)
+    decoded(m, surface)?.wait()?;
+    let mut d = lock(m)?;
+    let value = allocate_image(&mut d, w, h, fourcc)?;
+    d.buffers.get_mut(&value.buf).unwrap().bytes = vec![0; value.data_size as usize];
+    let result = readback(&mut d, surface, backend::Rect { x: 0, y: 0, w, h }, value.buf);
+    if let Err(e) = result { d.images.remove(&value.image_id); d.buffers.remove(&value.buf); return Err(e); }
+    out(image, value)
 });
 callback!(destroy_image(ctx, id: u32) |d| {
     let image = d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if d.buffer(image.buf)?.mapped { return Err(INVALID); }
@@ -1177,28 +1192,8 @@ callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, 
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
     // The copy engine converts neither depth nor chroma format: the image is the surface's own format.
     if image.format.fourcc != fourcc && !(fourcc == P010 && image.format.fourcc == P016) && !(fourcc == P012 && image.format.fourcc == P016) { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); }
-    let format = packed_format(fourcc);
-    let (spitch, soffsets, ssize) = format.packed(cw, ch);
-    let bytes = readback(m, surface)?; if bytes.len() != ssize { return Err(FAILED); }
-    let mut d = lock(m)?;
-    let b = d.buffers.get_mut(&image.buf).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if b.mapped { return Err(INVALID); }
-    let bps = format.bytes_per_sample() as usize;
-    let (dpitch, doffsets, _) = format.packed(w, h);
-    let mut copy = |plane: usize, rows: usize, x0: usize, y0: usize, row_bytes: usize| {
-        for row in 0..rows {
-            let start = soffsets[plane] as usize + (y0 + row) * spitch as usize + x0;
-            let dest = doffsets[plane] as usize + row * dpitch as usize;
-            b.bytes[dest..dest + row_bytes].copy_from_slice(&bytes[start..start + row_bytes]);
-        }
-    };
-    copy(0, h as usize, x as usize * bps, y as usize, w as usize * bps);
-    if format.chroma_444 {
-        copy(1, h as usize, x as usize * bps, y as usize, w as usize * bps);
-        copy(2, h as usize, x as usize * bps, y as usize, w as usize * bps);
-    } else {
-        copy(1, h as usize / 2, x as usize * bps, y as usize / 2, w as usize * bps);
-    }
-    Ok(())
+    decoded(m, surface)?.wait()?;
+    readback(&mut lock(m)?, surface, backend::Rect { x: x as u32, y: y as u32, w, h }, image.buf)
 });
 fn surface_attr(kind: VASurfaceAttribType, value: u32, settable: bool) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = Default::default();
