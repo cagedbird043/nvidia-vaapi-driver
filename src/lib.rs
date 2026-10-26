@@ -18,18 +18,42 @@ const FAILED: VAStatus = VA_STATUS_ERROR_OPERATION_FAILED as VAStatus;
 const UNIMPL: VAStatus = VA_STATUS_ERROR_UNIMPLEMENTED as VAStatus;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 const MAX_DIM: u32 = 4096;
-const PROFILES: [VAProfile; 4] = [
+const PROFILES: [VAProfile; 7] = [
     VAProfileH264Baseline,
     VAProfileH264ConstrainedBaseline,
     VAProfileH264Main,
     VAProfileH264High,
+    VAProfileHEVCMain,
+    VAProfileVP9Profile0,
+    VAProfileAV1Profile0,
 ];
+fn codec_of(profile: VAProfile) -> R<backend::Codec> {
+    use backend::Codec::*;
+    Ok(match profile {
+        va::VAProfileH264Baseline | va::VAProfileH264ConstrainedBaseline | va::VAProfileH264Main | va::VAProfileH264High => H264,
+        va::VAProfileHEVCMain => Hevc,
+        va::VAProfileVP9Profile0 => Vp9,
+        va::VAProfileAV1Profile0 => Av1,
+        _ => return Err(VA_STATUS_ERROR_UNSUPPORTED_PROFILE as VAStatus),
+    })
+}
+/// Element sizes of the codec's picture, IQ-matrix and slice parameter buffers.
+fn parameter_sizes(codec: backend::Codec) -> (usize, Option<usize>, usize) {
+    use backend::Codec::*;
+    match codec {
+        H264 => (size_of::<VAPictureParameterBufferH264>(), Some(size_of::<VAIQMatrixBufferH264>()), size_of::<VASliceParameterBufferH264>()),
+        Hevc => (size_of::<VAPictureParameterBufferHEVC>(), Some(size_of::<VAIQMatrixBufferHEVC>()), size_of::<VASliceParameterBufferHEVC>()),
+        Vp9 => (size_of::<VADecPictureParameterBufferVP9>(), None, size_of::<VASliceParameterBufferVP9>()),
+        Av1 => (size_of::<VADecPictureParameterBufferAV1>(), None, size_of::<VASliceParameterBufferAV1>()),
+    }
+}
 
+/// Buffers rendered for one picture, kept raw: the codec backend interprets the parameters.
 struct Frame {
     target: u32,
-    pic: Option<VAPictureParameterBufferH264>,
-    iq: Option<VAIQMatrixBufferH264>,
-    groups: Vec<Vec<VASliceParameterBufferH264>>,
+    pic: Option<Vec<u8>>,
+    iq: Option<Vec<u8>>,
+    groups: Vec<Vec<Vec<u8>>>, // slice parameter buffers, one entry per element
     data: Vec<Vec<u8>>,
     events: Vec<(bool, usize)>, // true: parameter group, false: data buffer
 }
@@ -78,7 +102,7 @@ impl Drop for Pending {
     }
 }
 enum Command {
-    Decode(Frame, Vec<VASliceParameterBufferH264>, Vec<u8>, Pending),
+    Decode(backend::Picture, Pending),
     Copy(u32, backend::Export, Pending),
     Readback(u32, mpsc::Sender<Result<Vec<u8>, String>>),
     Release(u32),
@@ -97,13 +121,13 @@ fn gpu<T>(r: Result<T, String>) -> R<T> {
     })
 }
 impl Worker {
-    fn new(pci: [u32; 4], w: u32, h: u32, surfaces: usize) -> R<Self> {
+    fn new(codec: backend::Codec, pci: [u32; 4], w: u32, h: u32, surfaces: usize) -> R<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("rustnv-nvdec".into())
             .spawn(move || {
-                let mut decoder = match backend::Decoder::new(pci, w, h, surfaces) {
+                let mut decoder = match backend::Decoder::new(codec, pci, w, h, surfaces) {
                     Ok(d) => {
                         let _ = ready_tx.send(Ok(()));
                         d
@@ -115,14 +139,8 @@ impl Worker {
                 };
                 while let Ok(cmd) = rx.recv() {
                     match cmd {
-                        Command::Decode(f, slices, data, done) => {
-                            let result = decoder.decode(
-                                f.target,
-                                f.pic.as_ref().unwrap(),
-                                f.iq.as_ref().unwrap(),
-                                &slices,
-                                &data,
-                            );
+                        Command::Decode(picture, done) => {
+                            let result = decoder.decode(&picture);
                             done.finish(result.map_err(|e| {
                                 eprintln!("rustnv: {e}");
                                 VA_STATUS_ERROR_DECODING_ERROR as VAStatus
@@ -247,6 +265,7 @@ impl Drop for OutputWorker {
     }
 }
 struct Context {
+    codec: backend::Codec,
     worker: Arc<Worker>,
     width: u32,
     height: u32,
@@ -518,28 +537,29 @@ callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: 
     if flags & !(VA_PROGRESSIVE as i32) != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     let targets: HashSet<u32> = array(targets, count(n)?)?.iter().copied().collect();
     for target in &targets { let s = d.surface(*target)?; if s.width < w as u32 || s.height < h as u32 { return Err(INVALID); } }
-    let worker = Arc::new(Worker::new(d.pci, w as u32, h as u32, targets.len())?); let key = d.id()?;
-    d.contexts.insert(key, Context { worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
+    let codec = codec_of(d.configs[&config])?;
+    let worker = Arc::new(Worker::new(codec, d.pci, w as u32, h as u32, targets.len())?); let key = d.id()?;
+    d.contexts.insert(key, Context { codec, worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
 });
 callback!(destroy_context(ctx, id: u32) |d| {
     d.contexts.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     d.buffers.retain(|_, b| b.context != Some(id));
     Ok(())
 });
-fn buffer_shape(kind: VABufferType, size: u32) -> bool {
+fn buffer_shape(codec: backend::Codec, kind: VABufferType, size: u32) -> bool {
+    let (pic, iq, slice) = parameter_sizes(codec);
+    let size = size as usize;
     match kind {
-        va::VAPictureParameterBufferType => {
-            size as usize == size_of::<VAPictureParameterBufferH264>()
-        }
-        va::VAIQMatrixBufferType => size as usize == size_of::<VAIQMatrixBufferH264>(),
-        va::VASliceParameterBufferType => size as usize == size_of::<VASliceParameterBufferH264>(),
+        va::VAPictureParameterBufferType => size == pic,
+        va::VAIQMatrixBufferType => iq == Some(size),
+        va::VASliceParameterBufferType => size == slice,
         va::VASliceDataBufferType => size != 0,
         _ => false,
     }
 }
 callback!(create_buffer(ctx, context: u32, kind: VABufferType, size: u32, n: u32, data: *mut c_void, id: *mut u32) |d| {
-    d.context(context)?; if id.is_null() || n == 0 { return Err(INVALID); }
-    if !buffer_shape(kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
+    let codec = d.context(context)?.codec; if id.is_null() || n == 0 { return Err(INVALID); }
+    if !buffer_shape(codec, kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
     let len = (size as usize).checked_mul(n as usize).filter(|v| *v <= isize::MAX as usize).ok_or(INVALID)?;
     let mut bytes = Vec::new(); bytes.try_reserve_exact(len).map_err(|_| VA_STATUS_ERROR_ALLOCATION_FAILED as VAStatus)?; bytes.resize(len, 0);
     if !data.is_null() { ptr::copy_nonoverlapping(data as *const u8, bytes.as_mut_ptr(), len); }
@@ -575,20 +595,19 @@ callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
     for key in ids {
         let b = d.buffers.get(key).unwrap(); let f = d.contexts.get_mut(&id).unwrap().frame.as_mut().unwrap();
         match b.kind {
-            va::VAPictureParameterBufferType => { if f.pic.is_some() || b.count != 1 { return Err(INVALID); } f.pic = Some(ptr::read_unaligned(b.bytes.as_ptr().cast())); }
-            va::VAIQMatrixBufferType => { if f.iq.is_some() || b.count != 1 { return Err(INVALID); } f.iq = Some(ptr::read_unaligned(b.bytes.as_ptr().cast())); }
-            va::VASliceParameterBufferType => { let mut group = Vec::with_capacity(b.count as usize); for i in 0..b.count as usize { group.push(ptr::read_unaligned(b.bytes.as_ptr().add(i * b.size as usize).cast())); } f.events.push((true,f.groups.len())); f.groups.push(group); }
+            va::VAPictureParameterBufferType => { if f.pic.is_some() || b.count != 1 { return Err(INVALID); } f.pic = Some(b.bytes[..b.size as usize].to_vec()); }
+            va::VAIQMatrixBufferType => { if f.iq.is_some() || b.count != 1 { return Err(INVALID); } f.iq = Some(b.bytes[..b.size as usize].to_vec()); }
+            va::VASliceParameterBufferType => { let group = b.bytes[..b.size as usize * b.count as usize].chunks_exact(b.size as usize).map(<[u8]>::to_vec).collect(); f.events.push((true,f.groups.len())); f.groups.push(group); }
             va::VASliceDataBufferType => { f.events.push((false,f.data.len())); f.data.push(b.bytes[..b.size as usize * b.count as usize].to_vec()); }
             _ => return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus),
         }
     } Ok(())
 });
-/// Gathers the frame's slices with offsets into one contiguous data buffer.
-unsafe fn prepare(f: &mut Frame) -> R<(Vec<VASliceParameterBufferH264>, Vec<u8>)> {
-    let pic = f.pic.as_ref().ok_or(INVALID)?;
-    if pic.CurrPic.picture_id != f.target || f.groups.is_empty() || f.data.is_empty() { return Err(INVALID); }
-    if pic.bit_depth_luma_minus8 != 0 || pic.bit_depth_chroma_minus8 != 0 || pic.seq_fields.bits.chroma_format_idc() != 1 || pic.seq_fields.bits.frame_mbs_only_flag() == 0 || pic.pic_fields.bits.field_pic_flag() != 0 || pic.num_slice_groups_minus1 != 0 { return Err(VA_STATUS_ERROR_UNSUPPORTED_PROFILE as VAStatus); }
-    if f.iq.is_none() { let mut iq: VAIQMatrixBufferH264 = zeroed(); iq.ScalingList4x4 = [[16; 16]; 6]; iq.ScalingList8x8 = [[16; 64]; 2]; f.iq = Some(iq); }
+/// Pairs every slice parameter element with its bytes, gathered into one contiguous data buffer.
+/// Every libva slice parameter struct starts with slice_data_size, slice_data_offset, slice_data_flag.
+fn prepare(f: &mut Frame) -> R<backend::Picture> {
+    let params = f.pic.take().ok_or(INVALID)?;
+    if f.groups.is_empty() || f.data.is_empty() { return Err(INVALID); }
     // Offsets are relative to the associated data buffer. Preserve submission
     // boundaries even across RenderPicture calls and multiple parameter groups.
     let mut association = vec![usize::MAX; f.groups.len()];
@@ -608,19 +627,20 @@ unsafe fn prepare(f: &mut Frame) -> R<(Vec<VASliceParameterBufferH264>, Vec<u8>)
         }
         if used.len() != f.data.len() { return Err(INVALID); }
     }
+    let field = |p: &[u8], i: usize| u32::from_ne_bytes(p[i * 4..i * 4 + 4].try_into().unwrap()) as usize;
     let mut slices = Vec::new(); let mut data = Vec::new();
     for (i, group) in f.groups.drain(..).enumerate() {
         let source = &f.data[association[i]];
-        for mut s in group {
-            if s.slice_data_flag != VA_SLICE_DATA_FLAG_ALL || s.slice_data_size == 0 { return Err(INVALID); }
-            let start = s.slice_data_offset as usize; let end = start.checked_add(s.slice_data_size as usize).ok_or(INVALID)?;
-            let bytes = source.get(start..end).ok_or(INVALID)?;
-            s.slice_data_offset = u32::try_from(data.len()).map_err(|_| INVALID)?;
-            data.extend_from_slice(bytes); slices.push(s);
+        for param in group {
+            let (size, offset, flag) = (field(&param, 0), field(&param, 1), field(&param, 2));
+            if flag != VA_SLICE_DATA_FLAG_ALL as usize || size == 0 { return Err(INVALID); }
+            let bytes = source.get(offset..offset.checked_add(size).ok_or(INVALID)?).ok_or(INVALID)?;
+            let start = data.len(); data.extend_from_slice(bytes);
+            slices.push(backend::Slice { param, data: start..data.len() });
         }
     }
     f.data.clear();
-    Ok((slices, data))
+    Ok(backend::Picture { target: f.target, params, iq: f.iq.take(), slices, data })
 }
 // Queues the decode and returns; its outcome is reported by vaSyncSurface.
 callback!(end_picture(ctx, id: u32) |d| {
@@ -628,7 +648,7 @@ callback!(end_picture(ctx, id: u32) |d| {
     let mut f = c.frame.take().ok_or(INVALID)?;
     let (worker, target) = (c.worker.clone(), f.target);
     let (decode, status) = match prepare(&mut f) {
-        Ok((slices, data)) => (worker.queue(move |done| Command::Decode(f, slices, data, done)), Ok(())),
+        Ok(picture) => (worker.queue(move |done| Command::Decode(picture, done)), Ok(())),
         Err(e) => (Completion::done(Err(e)), Err(e)),
     };
     let s = d.surfaces.get_mut(&target).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
@@ -881,24 +901,29 @@ unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
 
 /// PCI address of the NVIDIA GPU behind the DRM device libva opened for this display.
 /// Decoding on any other GPU would hand the application buffers its device cannot import.
+/// Uses only fstat on the fd and one sysfs file read, which sandboxed GPU processes (Chrome's
+/// broker allows /sys/dev/char/<major>:<minor>/device/...) still permit.
 unsafe fn drm_pci(ctx: VADriverContextP) -> Result<[u32; 4], String> {
-    use std::os::unix::fs::MetadataExt;
+    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
     let state = (*ctx).drm_state as *const drm_state;
     if state.is_null() || (*state).fd < 0 {
         return Err("the VA display has no DRM device".into());
     }
-    let rdev = std::fs::metadata(format!("/proc/self/fd/{}", (*state).fd))
+    let fd = BorrowedFd::borrow_raw((*state).fd);
+    let rdev = std::fs::File::from(fd.try_clone_to_owned().map_err(|e| format!("DRM fd: {e}"))?)
+        .metadata()
         .map_err(|e| format!("DRM fd: {e}"))?
         .rdev();
     let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
     let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
-    let device = std::fs::canonicalize(format!("/sys/dev/char/{major}:{minor}/device"))
-        .map_err(|e| format!("DRM device {major}:{minor}: {e}"))?;
-    let driver = std::fs::canonicalize(device.join("driver")).map_err(|e| format!("{}: {e}", device.display()))?;
-    if driver.file_name().is_none_or(|n| n != "nvidia") {
-        return Err(format!("{} is driven by {}, not nvidia", device.display(), driver.display()));
+    let path = format!("/sys/dev/char/{major}:{minor}/device/uevent");
+    let uevent = std::fs::read_to_string(&path).map_err(|e| format!("{path}: {e}"))?;
+    let value = |key: &str| uevent.lines().find_map(|l| l.strip_prefix(key)?.strip_prefix('='));
+    let driver = value("DRIVER").unwrap_or_default();
+    if driver != "nvidia" {
+        return Err(format!("DRM device {major}:{minor} is driven by {driver:?}, not nvidia"));
     }
-    let bdf = device.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+    let bdf = value("PCI_SLOT_NAME").ok_or_else(|| format!("{path}: no PCI_SLOT_NAME"))?;
     let fields: Vec<u32> = bdf
         .split([':', '.'])
         .map(|f| u32::from_str_radix(f, 16))
@@ -989,7 +1014,7 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         (*ctx).max_image_formats = 1;
         (*ctx).max_subpic_formats = 1;
         (*ctx).max_display_attributes = 1;
-        (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC H.264 driver\0".as_ptr().cast();
+        (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC driver\0".as_ptr().cast();
         (*ctx).pDriverData = Box::into_raw(Box::new(Mutex::new(Driver::new(pci)))).cast();
         (*ctx).vtable.write(table);
     })) {

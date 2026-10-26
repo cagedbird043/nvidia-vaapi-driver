@@ -1,56 +1,98 @@
-# Rust NVIDIA VA-API H.264 驱动
+# Rust NVIDIA VA-API 解码驱动
 
-独立的宿主机 VA-API 驱动，通过共享 Rust RM 后端直接使用 NVIDIA NVDEC。驱动名为 `rustnv`，在单个测试进程中选择，不安装到系统。
+独立的宿主机 VA-API 解码驱动，通过共享 Rust RM 后端直接使用 NVIDIA NVDEC，不调用 CUDA 或 libnvcuvid。驱动名为 `rustnv`，
+在单个测试进程中选择，不安装到系统。
 
 ## 支持范围
 
-- H.264 Baseline / Constrained Baseline / Main / High，逐行、8-bit、4:2:0。
-- P/B 参考帧、多切片、宏块补齐与显示尺寸裁剪。
-- NV12 CPU 下载，以及 DRM PRIME2 的 R8 + RG88 分层或 NV12 合并描述符。
-- 解码参数直接来自 VA-API，转换为 NVDEC 描述符；不重建 SPS/PPS 码流，不调用 CUDA 或 libnvcuvid。
-- 解码 context 销毁后，存活的 VA surface 仍持有 worker 和画面资源。
-- surface 可以在解码前导出。导出的 backing 在 surface 生命周期内固定；后续解码通过 GPU copy engine 更新它，随后同步完成。显示路径无 CPU 画面回拷，但包含一次 GPU 拷贝。
-- 每个 context 的 GPU 对象由专属线程持有；VA 回调通过消息调用。当前 EndPicture 同步等待解码完成。
+| 格式 | VA profile |
+|---|---|
+| H.264 | Baseline / Constrained Baseline / Main / High |
+| HEVC | Main |
+| VP9 | Profile 0 |
+| AV1 | Profile 0 |
 
-这不是现有驱动的全功能替代品：不支持编码、其他编解码格式、隔行、10-bit、FMO、分段 slice，以及 CPU 图像上传/视频后处理。未实现的入口明确返回错误。mpv 的可选 CPU 上传探测会记录一次 `vaPutImage` 不支持，已验证的硬解显示不依赖该功能。
+已验证的覆盖见下方“硬件回归”。
 
-RM 使用精确 NVIDIA 驱动 ABI 匹配；未知驱动版本会拒绝运行。本次运行验证范围仅为 RTX 4060 Laptop / nvidia-open 615.78.08 / x86_64 glibc。
+- 全部为 8-bit 4:2:0 逐行，支持非宏块/CTB/超块对齐的显示尺寸。
+- 解码参数直接来自 VA-API，转换为 NVDEC 描述符；不重建参数集码流。
+- 输出：NV12 CPU 下载；DRM PRIME2 的 R8 + RG88 分层或 NV12 合并描述符（块线性修饰符）。
+- 只在 libva 打开的那块 NVIDIA GPU 上解码；初始化时由 DRM fd 识别设备，非 nvidia 驱动的节点直接拒绝。
+
+明确拒绝并返回错误的情况：10/12-bit、非 4:2:0、隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
+VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 与帧间 superres。不支持编码、CPU 图像上传和视频后处理。
+mpv 的可选 CPU 上传探测会记录一次 `vaPutImage` 不支持，硬解显示不依赖该功能。
+
+## 设计
+
+- 每个 context 一个 worker 线程持有 RM 会话；VA 回调把解码和导出拷贝排进队列后返回，`vaSyncSurface`、`vaDeriveImage`、
+  `vaGetImage` 不持全局锁等待完成。worker 退出时未完成的工作置为失败，等待方不会卡死。
+- surface 可以在解码前导出；导出的显存在 surface 生命周期内固定，每次解码后由 GPU copy engine 更新。显示路径没有 CPU 拷贝，
+  有一次 GPU 拷贝。
+- 解码 context 销毁后，存活的 surface 仍持有 worker 和画面。
+- `src/backend/mod.rs` 管会话、导出和下载；`src/backend/{h264,hevc,vp9,av1}.rs` 各自把 VA 参数转换成 RM 的描述符输入。
+
+RM 按 NVIDIA 驱动版本精确匹配 ABI，不认识的版本拒绝运行。验证范围仅为 RTX 4060 Laptop / nvidia-open 615.78.08 / x86_64 glibc。
 
 ## 构建
 
-依赖 Rust、Clang/libclang、libva 开发头文件；运行验证还需要 FFmpeg（含 libx264）和 mpv。共享 RM 源码位于相邻的 `../waydroid-nvidia/nvidia-prolapse/driver-source/native`，需要包含本工作区的外部解码器与输出分配接口改动。
-
-在本目录执行：
+依赖 Rust、Clang/libclang、libva 开发头文件；回归还需要 FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）。
+共享 RM 源码在相邻的 `../waydroid-nvidia/nvidia-prolapse/driver-source/native`。
 
 ```sh
 cargo build --release
 ln -sfn librustnv_drv_video.so target/release/rustnv_drv_video.so
 ```
 
-## 播放
+## 使用
 
 ```sh
-LIBVA_DRIVERS_PATH="$PWD/target/release" LIBVA_DRIVER_NAME=rustnv \
-  mpv --no-config --hwdec=vaapi --hwdec-software-fallback=no \
-  --vo=gpu --gpu-api=opengl --gpu-context=wayland video.mp4
+export LIBVA_DRIVERS_PATH="$PWD/target/release" LIBVA_DRIVER_NAME=rustnv
+mpv --hwdec=vaapi --hwdec-software-fallback=no --vo=gpu --gpu-api=opengl video.mp4
 ```
 
-应显示 `Using hardware decoding (vaapi)` 和 `VO: [gpu] ... vaapi[nv12]`。上述环境变量只作用于该进程。渲染使用宿主 NVIDIA EGL/GL，解码不加载 `libcuda`、`libnvcuvid`。
+Firefox：`media.ffmpeg.vaapi.enabled=true` 即可，RDD 进程里会出现 `rustnv-nvdec` 线程。
+
+Chrome 目前需要关闭 GPU 沙箱：
+
+```sh
+google-chrome-stable --disable-gpu-sandbox --render-node-override=/dev/dri/renderD129 \
+  --enable-features=VaapiVideoDecoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL
+```
+
+默认沙箱下，Chrome 在启用沙箱前初始化、查询并 `vaTerminate` 了驱动，之后在沙箱内重新初始化时被 broker 拒绝访问
+`/sys/dev/char/<major>:<minor>/device/drm`，报 `Could not get a valid VA display`，驱动的初始化函数没有被再次调用。
+同样条件下 C 版 nvidia-vaapi-driver 能工作，差异的原因尚未查明。
 
 ## 硬件回归
 
 ```sh
-python3 tests/h264.py --device /dev/dri/renderD129
+python3 tests/decode.py                # 全部格式
+python3 tests/decode.py --codec av1    # 单个格式
 ```
 
-脚本生成临时测试视频，比较软件与 VA-API 下载后的每一帧 NV12 哈希，检查包含尾帧的精确帧数；失败即退出，结束自动清理样本。`--driver` 可指定其它构建的 `.so`。
+脚本生成临时测试视频，逐帧比较软件解码与 VA-API 下载结果的 NV12 哈希，并检查包含尾帧在内的精确帧数，失败即退出。
 
 2026-10-26 实测：
 
-| 样本 | 覆盖 | 结果 |
+| 用例 | 覆盖 | 结果 |
 |---|---|---|
-| High 1280×720 | 3 B 帧、重复关键帧、surface 池循环 | 480/480 帧逐字节一致 |
-| Main 854×480 | 2 B 帧、4 slices、宏块 padding | 96/96 帧逐字节一致 |
-| Baseline 640×360 | 无 B 帧 | 90/90 帧逐字节一致 |
+| h264-high 1280×720 | 3 B 帧、surface 池循环 | 480/480 逐字节一致 |
+| h264-main-slices 854×480 | 2 B 帧、4 slices、宏块补齐 | 96/96 |
+| h264-baseline 640×360 | 无 B 帧 | 90/90 |
+| hevc-main 1280×720 | 4 B 帧 | 240/240 |
+| hevc-slices-crop 854×480 | 4 slices、CTB 补齐 | 96/96 |
+| vp9-altref 1280×720 | 隐藏 altref 帧 | 240/240 |
+| vp9-tiles-crop 854×480 | tile 列、超块补齐 | 96/96 |
+| av1-main 1280×720 | SVT-AV1 | 240/240 |
+| av1-tiles-crop 854×480 | libaom、2×2 tiles | 96/96 |
 
-mpv Wayland/OpenGL 已实播 High 与 Main，检查了跳转、循环和切换视频；观察时 `hwdec-current=vaapi`，解码/显示丢帧均为 0。原有原生 H.264 码流接口另外通过 60 帧逐字节比对。
+性能（ffmpeg VA-API 解码吞吐，与系统里的 C 版 nvidia-vaapi-driver 对比）：
+
+| 片源 | rustnv | C 驱动 |
+|---|---|---|
+| H.264 1080p60 | 773 fps，CPU 0.30 ms/帧 | 680 fps，0.56 ms/帧 |
+| H.264 4K60 | 216 fps，CPU 0.91 ms/帧 | 203 fps，1.35 ms/帧 |
+
+mpv 实时播放 H.264 4K60 两者都是 60 fps、0 丢帧。浏览器：Firefox 158 播放 H.264/HEVC/VP9/AV1 由 rustnv 解码；
+Chrome 156（关闭 GPU 沙箱）四种格式由 rustnv 解码，GPU 进程不加载 `libcuda`/`libnvcuvid`。

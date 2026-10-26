@@ -1,20 +1,14 @@
-//! VA picture parameters drive the RM session directly; display ordering belongs to libva's client.
+//! H.264: VA picture parameters drive the RM descriptor builder directly; display ordering
+//! belongs to libva's client.
+use super::{Frontend, Picture};
 use crate::va;
 use nv_bionic_native::video::{
     self,
     h264::{codec::H264Decoder, desc, legacy, ps, MAX_SLOTS},
-    session::{OutputAllocation, OutputAllocator, Session, SessionInfo, Target},
-    Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, SurfaceLayout, VResult,
-    VideoError,
+    Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError,
 };
-use std::{
-    cell::RefCell,
-    collections::HashMap,
-    os::fd::{AsRawFd, OwnedFd},
-    rc::Rc,
-};
+use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
-const BLOCK_LINEAR: u64 = 0x0300_0000_0060_6010;
 fn invalid(s: impl Into<String>) -> VideoError {
     VideoError::Invalid(s.into())
 }
@@ -22,105 +16,6 @@ fn valid(p: &va::VAPictureH264) -> bool {
     p.picture_id != u32::MAX && p.flags & va::VA_PICTURE_H264_INVALID == 0
 }
 
-pub struct Export {
-    pub fds: [OwnedFd; 2],
-    pub pitches: [u32; 2],
-    pub offsets: [u32; 2],
-    pub sizes: [u32; 2],
-    pub modifier: u64,
-}
-impl Export {
-    pub fn try_clone(&self) -> Result<Self, String> {
-        Ok(Self {
-            fds: [
-                self.fds[0].try_clone().map_err(|e| e.to_string())?,
-                self.fds[1].try_clone().map_err(|e| e.to_string())?,
-            ],
-            pitches: self.pitches,
-            offsets: self.offsets,
-            sizes: self.sizes,
-            modifier: self.modifier,
-        })
-    }
-}
-
-struct OutputBacking {
-    allocation: OutputAllocation,
-    layout: SurfaceLayout,
-    width: u32,
-    height: u32,
-}
-
-/// Stable VA surface storage, including surfaces exported before their first decode.
-/// This allocator is thread-confined like the RM device it owns.
-pub struct OutputPool {
-    allocator: OutputAllocator,
-    surfaces: HashMap<u32, OutputBacking>,
-}
-impl OutputPool {
-    pub fn new(pci: [u32; 4]) -> Result<Self, String> {
-        let dev = video::VideoDevice::open_on(Some(pci)).map_err(|e| e.to_string())?;
-        if !matches!(dev.info.nvdec_class, 0xc4b0 | 0xc7b0 | 0xc9b0) {
-            return Err(
-                "VA export requires verified Turing/Ampere/Ada block-linear NV12 layout".into(),
-            );
-        }
-        Ok(Self {
-            allocator: OutputAllocator::new(&dev).map_err(|e| e.to_string())?,
-            surfaces: HashMap::new(),
-        })
-    }
-
-    pub fn export(&mut self, id: u32, width: u32, height: u32) -> Result<Export, String> {
-        if width == 0 || height == 0 || width > 4096 || height > 4096 {
-            return Err("NV12 output dimensions must be within 1..4096".into());
-        }
-        if let Some(backing) = self.surfaces.get(&id) {
-            if (backing.width, backing.height) != (width, height) {
-                return Err("cannot change the dimensions of an existing surface backing".into());
-            }
-        } else {
-            let layout = SurfaceLayout::new(width, height, 1);
-            let allocation = self
-                .allocator
-                .allocate_zeroed(layout.size)
-                .map_err(|e| e.to_string())?;
-            self.surfaces.insert(
-                id,
-                OutputBacking {
-                    allocation,
-                    layout,
-                    width,
-                    height,
-                },
-            );
-        }
-        let backing = &self.surfaces[&id];
-        let layout = backing.layout;
-        Ok(Export {
-            fds: [
-                backing
-                    .allocation
-                    .fd
-                    .try_clone()
-                    .map_err(|e| e.to_string())?,
-                backing
-                    .allocation
-                    .fd
-                    .try_clone()
-                    .map_err(|e| e.to_string())?,
-            ],
-            pitches: [layout.pitch; 2],
-            offsets: [0, layout.chroma_offset as u32],
-            sizes: [layout.size as u32; 2],
-            modifier: BLOCK_LINEAR,
-        })
-    }
-
-    pub fn release(&mut self, id: u32) {
-        self.surfaces.remove(&id);
-    }
-}
 struct Parameters {
     target: u32,
     pic: va::VAPictureParameterBufferH264,
@@ -386,73 +281,49 @@ impl CodecDecoder for VaCodec {
     }
 }
 
-pub struct Decoder {
-    session: Session,
+struct Front {
     state: Rc<RefCell<State>>,
-    pictures: HashMap<u32, u64>,
-    /// Linear CPU-readable copy target, allocated on the first download and reused.
-    staging: Option<OutputAllocation>,
     width: u32,
     height: u32,
 }
-impl Decoder {
-    /// `surfaces` is the number of VA render targets bound to the context (0 when the client binds
-    /// none up front). Each target retains at most one decoded picture and one more is being decoded.
-    pub fn new(pci: [u32; 4], width: u32, height: u32, surfaces: usize) -> Result<Self, String> {
-        let dev = video::VideoDevice::open_on(Some(pci)).map_err(|e| e.to_string())?;
-        // This exact DRM modifier describes the verified pre-Blackwell NV12 layout.
-        if !matches!(dev.info.nvdec_class, 0xc4b0 | 0xc7b0 | 0xc9b0) {
-            return Err(
-                "VA export requires verified Turing/Ampere/Ada block-linear NV12 layout".into(),
-            );
-        }
-        let state = Rc::new(RefCell::new(State::default()));
-        let codec = VaCodec {
-            state: state.clone(),
-            machinery: H264Decoder::new(dev.info.nvdec_class, width, height, &[])
-                .map_err(|e| e.to_string())?,
-            pending: None,
-            bits: None,
-            offsets: Vec::new(),
-            built_slot: 0,
-            previous_slot: 0,
-            width,
-            height,
+
+pub(super) fn create(
+    class: u32,
+    width: u32,
+    height: u32,
+) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
+    let state = Rc::new(RefCell::new(State::default()));
+    let codec = VaCodec {
+        state: state.clone(),
+        machinery: H264Decoder::new(class, width, height, &[]).map_err(|e| e.to_string())?,
+        pending: None,
+        bits: None,
+        offsets: Vec::new(),
+        built_slot: 0,
+        previous_slot: 0,
+        width,
+        height,
+    };
+    Ok((Box::new(Front { state, width, height }), Box::new(codec)))
+}
+
+impl Frontend for Front {
+    fn stage(&mut self, picture: &Picture) -> Result<Vec<u8>, String> {
+        let pic: va::VAPictureParameterBufferH264 = super::read(&picture.params, "H.264 picture parameters")?;
+        let iq: va::VAIQMatrixBufferH264 = match &picture.iq {
+            Some(bytes) => super::read(bytes, "H.264 IQ matrix")?,
+            None => {
+                // Absent matrices mean flat scaling lists.
+                let mut iq = va::VAIQMatrixBufferH264::default();
+                iq.ScalingList4x4 = [[16; 16]; 6];
+                iq.ScalingList8x8 = [[16; 64]; 2];
+                iq
+            }
         };
-        let session = Session::with_codec(
-            &dev,
-            SessionInfo {
-                codec: video::CODEC_H264,
-                max_width: width,
-                max_height: height,
-                bit_depth: 8,
-                // The session pool holds dpb_size() + 2 surfaces before the extra slots.
-                extra_output_slots: if surfaces == 0 {
-                    32
-                } else {
-                    u32::try_from((surfaces + 1).saturating_sub(16 + 2)).map_err(|_| "too many surfaces")?
-                },
-            },
-            Box::new(codec),
-        )
-        .map_err(|e| e.to_string())?;
-        Ok(Self {
-            session,
-            state,
-            pictures: HashMap::new(),
-            staging: None,
-            width,
-            height,
-        })
-    }
-    pub fn decode(
-        &mut self,
-        target: u32,
-        pic: &va::VAPictureParameterBufferH264,
-        iq: &va::VAIQMatrixBufferH264,
-        slices: &[va::VASliceParameterBufferH264],
-        data: &[u8],
-    ) -> Result<(), String> {
+        let target = picture.target;
+        if pic.CurrPic.picture_id != target {
+            return Err("H.264 CurrPic is not the render target".into());
+        }
         let sf = unsafe { pic.seq_fields.value };
         let pf = unsafe { pic.pic_fields.value };
         if pic.bit_depth_luma_minus8 != 0 || pic.bit_depth_chroma_minus8 != 0 {
@@ -465,7 +336,7 @@ impl Decoder {
         {
             return Err("only non-FMO 8-bit 4:2:0 H.264 is supported".into());
         }
-        if slices.is_empty() || slices.len() > 256 {
+        if picture.slices.is_empty() || picture.slices.len() > 256 {
             return Err("H.264 requires 1..256 complete slices".into());
         }
         let coded_w = (u32::from(pic.picture_width_in_mbs_minus1) + 1) * 16;
@@ -474,17 +345,15 @@ impl Decoder {
         {
             return Err("H.264 coded dimensions do not match context".into());
         }
-        let mut bits = Vec::with_capacity(data.len() + slices.len() * 3);
-        let mut offsets = Vec::with_capacity(slices.len());
-        for s in slices {
-            if s.slice_data_flag != 0 || !matches!(s.slice_type % 5, 0 | 1 | 2) {
-                return Err("fragmented or SP/SI H.264 slices are unsupported".into());
+        let mut slices = Vec::with_capacity(picture.slices.len());
+        let mut bits = Vec::with_capacity(picture.data.len() + picture.slices.len() * 3);
+        let mut offsets = Vec::with_capacity(picture.slices.len());
+        for slice in &picture.slices {
+            let s: va::VASliceParameterBufferH264 = super::read(&slice.param, "H.264 slice parameters")?;
+            if !matches!(s.slice_type % 5, 0 | 1 | 2) {
+                return Err("SP/SI H.264 slices are unsupported".into());
             }
-            let start = s.slice_data_offset as usize;
-            let end = start
-                .checked_add(s.slice_data_size as usize)
-                .ok_or("slice range overflow")?;
-            let nal = data.get(start..end).ok_or("slice outside data buffer")?;
+            let nal = &picture.data[slice.data.clone()];
             let prefix = if nal.starts_with(&[0, 0, 0, 1]) {
                 4
             } else if nal.starts_with(&[0, 0, 1]) {
@@ -499,126 +368,38 @@ impl Decoder {
             offsets.push(bits.len() as u32);
             bits.extend_from_slice(&[0, 0, 1]);
             bits.extend_from_slice(nal);
+            slices.push(s);
         }
         // VA supplies authoritative DPB state before each picture. Keep only those GPU
         // references, but retain every live VA output separately through Session picture ids.
+        let mut state = self.state.borrow_mut();
+        let mut refs = Vec::new();
+        for r in pic
+            .ReferenceFrames
+            .iter()
+            .filter(|r| valid(r) && r.flags & va::VA_PICTURE_H264_NON_EXISTING == 0)
         {
-            let mut state = self.state.borrow_mut();
-            let mut refs = Vec::new();
-            for r in pic
-                .ReferenceFrames
-                .iter()
-                .filter(|r| valid(r) && r.flags & va::VA_PICTURE_H264_NON_EXISTING == 0)
-            {
-                if r.picture_id == target {
-                    return Err("decode target is also a reference".into());
-                }
-                let &(surface, _) = state
-                    .surfaces
-                    .get(&r.picture_id)
-                    .ok_or_else(|| format!("unknown reference surface {}", r.picture_id))?;
-                refs.push(surface);
+            if r.picture_id == target {
+                return Err("decode target is also a reference".into());
             }
-            state.refs = refs;
-            state.pending = Some(Parameters {
-                target,
-                pic: *pic,
-                iq: *iq,
-                slices: slices.to_vec(),
-                offsets,
-            });
+            let &(surface, _) = state
+                .surfaces
+                .get(&r.picture_id)
+                .ok_or_else(|| format!("unknown reference surface {}", r.picture_id))?;
+            refs.push(surface);
         }
-        if let Some(id) = self.pictures.remove(&target) {
-            self.session.release(id).map_err(|e| e.to_string())?;
-        }
-        self.session
-            .decode(&bits, u64::from(target), 0)
-            .map_err(|e| e.to_string())?;
-        let (id, _, _) = self
-            .session
-            .next_picture()
-            .ok_or("RM session produced no picture")?;
-        self.pictures.insert(target, id);
-        // EndPicture completes synchronously; VA surface-ready/sync never precedes GPU completion.
-        self.session.wait_picture(id).map_err(|e| e.to_string())?;
-        Ok(())
+        state.refs = refs;
+        state.pending = Some(Parameters {
+            target,
+            pic,
+            iq,
+            slices,
+            offsets,
+        });
+        Ok(bits)
     }
 
-    /// Copy decoded pixels into the surface's stable externally shared storage.
-    /// The copy engine preserves block-linear layout; no pixels cross the CPU.
-    pub fn copy_into(&mut self, target: u32, output: &Export) -> Result<(), String> {
-        let id = *self
-            .pictures
-            .get(&target)
-            .ok_or("surface has not been decoded")?;
-        let target = Target {
-            dmabuf_fd: [output.fds[0].as_raw_fd(), output.fds[1].as_raw_fd(), -1],
-            offset: [
-                u64::from(output.offsets[0]),
-                u64::from(output.offsets[1]),
-                0,
-            ],
-            pitch: [output.pitches[0], output.pitches[1], 0],
-            modifier: output.modifier,
-            format: video::FORMAT_NV12,
-            width: self.width,
-            height: self.height,
-            acquire_fence_fd: -1,
-        };
-        self.session
-            .copy_out_wait(id, &target)
-            .map_err(|e| e.to_string())
-    }
-    pub fn readback(&mut self, target: u32) -> Result<Vec<u8>, String> {
-        let id = *self
-            .pictures
-            .get(&target)
-            .ok_or("surface has not been decoded")?;
-        let pitch = self.width.next_multiple_of(2);
-        let y = pitch as usize * self.height as usize;
-        let size = y + pitch as usize * self.height.div_ceil(2) as usize;
-        if self.staging.is_none() {
-            let alloc = self
-                .session
-                .allocate_output(size.next_multiple_of(65536))
-                .map_err(|e| e.to_string())?;
-            self.staging = Some(alloc);
-        }
-        let alloc = self.staging.as_ref().unwrap();
-        let t = Target {
-            dmabuf_fd: [alloc.fd.as_raw_fd(), alloc.fd.as_raw_fd(), -1],
-            offset: [0, y as u64, 0],
-            pitch: [pitch, pitch, 0],
-            modifier: 0,
-            format: video::FORMAT_NV12,
-            width: self.width,
-            height: self.height,
-            acquire_fence_fd: -1,
-        };
-        self.session
-            .copy_out_wait(id, &t)
-            .map_err(|e| e.to_string())?;
-        let map = alloc.map().map_err(|e| e.to_string())?;
-        let mut packed = vec![
-            0;
-            self.width as usize * self.height as usize
-                + pitch as usize * self.height.div_ceil(2) as usize
-        ];
-        for row in 0..self.height as usize {
-            map.read_bytes(
-                row * pitch as usize,
-                &mut packed[row * self.width as usize..(row + 1) * self.width as usize],
-            )
-            .map_err(|e| e.to_string())?;
-        }
-        map.read_bytes(y, &mut packed[self.width as usize * self.height as usize..])
-            .map_err(|e| e.to_string())?;
-        Ok(packed)
-    }
-    pub fn release_surface(&mut self, target: u32) {
-        if let Some(id) = self.pictures.remove(&target) {
-            let _ = self.session.release(id);
-        }
+    fn release(&mut self, target: u32) {
         self.state.borrow_mut().surfaces.remove(&target);
     }
 }
