@@ -60,9 +60,12 @@ google-chrome-stable --disable-gpu-sandbox --render-node-override=/dev/dri/rende
   --enable-features=VaapiVideoDecoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL
 ```
 
-默认沙箱下，Chrome 在启用沙箱前初始化、查询并 `vaTerminate` 了驱动，之后在沙箱内重新初始化时被 broker 拒绝访问
-`/sys/dev/char/<major>:<minor>/device/drm`，报 `Could not get a valid VA display`，驱动的初始化函数没有被再次调用。
-同样条件下 C 版 nvidia-vaapi-driver 能工作，差异的原因尚未查明。
+默认沙箱下，Chrome 在启用沙箱前初始化、查询并 `vaTerminate` 了驱动；解码时在 seccomp 沙箱内重新打开 VA display，
+访问 `/sys/dev/char/<major>:<minor>/device/drm` 被 Chrome 的 broker 拒绝，报 `Could not get a valid VA display`，
+驱动的初始化函数不会再被调用。这是 Chrome 对 NVIDIA 的 VA-API 沙箱策略不完整，驱动本身无法绕过。
+C 版 nvidia-vaapi-driver 看似能在默认设置下工作，是因为它加载的 libcuda 在沙箱启用前就创建了线程，Chrome 报
+`InitializeSandbox() called with multiple threads in process gpu-process` 后 GPU 进程没有 seccomp（`/proc/<pid>/status` 中
+`Seccomp: 0`），效果等同于 `--disable-gpu-sandbox`。
 
 ## 硬件回归
 
