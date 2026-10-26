@@ -7,21 +7,28 @@
 
 ### 解码（VAEntrypointVLD）
 
-| 格式 | VA profile |
-|---|---|
-| H.264 | Baseline / Constrained Baseline / Main / High |
-| HEVC | Main |
-| VP9 | Profile 0 |
-| AV1 | Profile 0 |
+| 格式 | VA profile | surface / 图像格式 |
+|---|---|---|
+| H.264 | Constrained Baseline / Main / High | NV12 |
+| HEVC | Main / Main10 / Main12 | NV12 / P010 / P012 |
+| HEVC | Main444 / Main444_10 / Main444_12 | 444P / Q416 / Q416 |
+| VP9 | Profile 0 / Profile 2（10、12-bit） | NV12 / P010、P012 |
+| AV1 | Profile 0（8、10-bit） | NV12 / P010 |
+
+与 C 驱动的 VLD 列表相比，只缺 MPEG-2/MPEG-4/VC-1/VP8/JPEG（第 4–5 阶段）。VP9 Profile 2、AV1 的 surface 位深由 `vaCreateSurfaces` 的 RTFormat 决定，
+context 在第一帧按目标 surface 重建解码器。
 
 已验证的覆盖见下方“硬件回归”。
 
-- 全部为 8-bit 4:2:0 逐行，支持非宏块/CTB/超块对齐的显示尺寸。
+- 逐行，支持非宏块/CTB/超块对齐的显示尺寸。10/12-bit 样本放在 16 位容器高位（P010/P012/Q416，与引擎输出一致）。
+- 12-bit 4:2:0 的 DRM 描述符 fourcc 报 P016（与 C 驱动一致）；4:4:4 的分层描述符为三个 R8 或 R16 平面，合并描述符仅 444P（`YU24`）。
+- HEVC 4:4:4/12-bit 经 range extension 描述符（`VAPictureParameterBufferHEVCExtension`）；NVDEC 无 AV1 12-bit、VP9/AV1 4:4:4、4:2:2。
+- 解码 surface 作编码输入：8/10-bit 4:2:0 走 copy engine；4:4:4 surface 作编码输入不支持（NVENC 的 4:4:4 输入是交错 chroma，copy engine 一次只能搬一个平面，见“遗留”）。
 - 解码参数直接来自 VA-API，转换为 NVDEC 描述符；不重建参数集码流。
 - 输出：NV12 CPU 下载；DRM PRIME2 的 R8 + RG88 分层或 NV12 合并描述符（块线性修饰符）。
 - 只在 libva 打开的那块 NVIDIA GPU 上解码；初始化时由 DRM fd 识别设备，非 nvidia 驱动的节点直接拒绝。
 
-解码明确拒绝并返回错误的情况：10/12-bit、非 4:2:0、隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
+解码明确拒绝并返回错误的情况：4:2:2、VP9/AV1 4:4:4、AV1 12-bit、隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
 VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 与帧间 superres。不支持视频后处理。
 
 ### 编码（VAEntrypointEncSlice）
@@ -40,7 +47,7 @@ VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 
 - 8-bit 444P 直接交给 RM 做 tiled chroma interleave。Q416 使用每个 context 复用的 chroma staging 缓冲，将两个 16-bit 平面交错后上传；luma 不做 staging 拷贝。
 - H.264 / HEVC 忽略应用 packed SPS/PPS/slice，使用 RM 生成的参数集，在每个 IDR 前重复。AV1 接受 packed sequence 参数，RM 输出 in-band sequence OBU。
 - coded buffer map 返回 `VACodedBufferSegment`（单段链、`VA_CODED_BUF_STATUS_SINGLE_NALU`）。提交当前为同步编码，因此 surface / buffer 同步查询在提交返回后已完成。
-- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface 作编码输入不经 CPU：surface 的导出 backing（8 行 GOB、单 GOB 块高的块线性）由 GPU copy engine 重排进 NVENC 输入槽，字节与 CPU tiler 一致。外部 DMA-BUF 的 NV12 / P010 同走 copy engine；BGRA 先经 copy engine 拷入系统内存 staging，再由 CPU 按 BT.709 转换（见“遗留”）。
+- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface（8/10-bit 4:2:0）作编码输入不经 CPU：surface 的导出 backing（8 行 GOB、单 GOB 块高的块线性）由 GPU copy engine 重排进 NVENC 输入槽，字节与 CPU tiler 一致。外部 DMA-BUF 的 NV12 / P010 同走 copy engine；BGRA 先经 copy engine 拷入系统内存 staging，再由 CPU 按 BT.709 转换（见“遗留”）。
 - RM 的帧率接口为整数，分数帧率四舍五入。RateControl / FrameRate misc 参数被消费；其余 misc（包含 HRD / QualityLevel）与当前 C 后端一样接受但不消费。
 
 FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由回归脚本里的直接 VA 客户端测试，并检查输出色度/位深。
@@ -115,6 +122,52 @@ python3 tests/decode.py --codec av1    # 单个格式
 | av1-main 1280×720 | SVT-AV1 | 240/240 |
 | av1-tiles-crop 854×480 | libaom、2×2 tiles | 96/96 |
 
+高位深与 4:4:4（`tests/decode.py`，10 例，`--c-driver` 同时跑 C 驱动）：10/12-bit 与 4:4:4 样片用 `tests/va_dump.c`
+（libavcodec VA-API，`vaGetImage` 与 `vaDeriveImage` 各读一遍，不转换像素格式）与 ffmpeg 软解逐字节比较，Q416 与软解左移到高位后比较；
+再由 `tests/dmabuf_egl.c` 把 `vaExportSurfaceHandle` 导出的分层经 EGL（GBM，NVIDIA）导入读回，与 `vaGetImage` 比较。
+
+| 用例 | 覆盖 | 结果 |
+|---|---|---|
+| hevc-main10 1280×720 | 4 B 帧 | 240/240 逐字节一致，EGL 一致 |
+| hevc-main10-slices-crop 850×478 | 4 slices、非对齐 | 96/96 |
+| hevc-main12 854×480 | 12-bit | 96/96 |
+| hevc-444-8 850×478 | 444P | 96/96 |
+| hevc-444-10 1280×720 | Q416 | 120/120 |
+| hevc-444-12-slices 850×478 | 3 slices、Q416 | 96/96 |
+| vp9-p2-10 1280×720 | altref | 240/240 |
+| vp9-p2-12-tiles 850×478 | tile 列 | 96/96 |
+| av1-10 1280×720 | SVT-AV1 | 240/240 |
+| av1-10-tiles-crop 850×478 | libaom、2×2 tiles | 96/96 |
+
+C 驱动对同样样片（va_dump，同一读法）：所有 10/12-bit、444 样片都在 vaGetImage 或 vaDeriveImage 上失败（色度平面首字节起不一致，或 `vaDeriveImage` 返回失败），只记录。
+
+高位深吞吐（ffmpeg `-hwaccel vaapi -f null`，片源循环）：
+
+| 片源 | rustnv | C 驱动 |
+|---|---|---|
+| HEVC Main10 1080p | 1997 fps | 2043 fps |
+| HEVC Main10 4K | 529 fps | 499 fps |
+| AV1 10-bit 1080p | 1498 fps | 1497 fps |
+| AV1 10-bit 4K | 428 fps | 428 fps |
+
+HEVC Main10 1080p 18000 帧无错误，进程 RSS 332 MB 持平（C 驱动 352 MB）。mpv `--hwdec=vaapi --vo=gpu-next`（Wayland）播放 HEVC Main10 与 AV1 10-bit，
+截图与软解截图 PSNR 为 inf（逐像素一致）。
+
+浏览器（1080p、120 帧的 HEVC Main10 / VP9 Profile 2 / AV1 10-bit，临时 profile，`LIBVA_TRACE` 统计 `vaEndPicture`）：
+
+| 浏览器 | 格式 | rustnv | C 驱动 |
+|---|---|---|---|
+| Chrome 156 | HEVC Main10 | 硬解 120 次 | 120 次 |
+| Chrome 156 | VP9 Profile 2 | 130 次 | 130 次 |
+| Chrome 156 | AV1 10-bit | 120 次 | 119 次 |
+| Firefox（`media.ffmpeg.vaapi.enabled`、`media.hardware-video-decoding.force-enabled`、`MOZ_DISABLE_RDD_SANDBOX=1`） | HEVC Main10 / VP9 Profile 2 / AV1 10-bit | 509 / 550 / 508 次，无错误 | 490 / 529 / 490 次 |
+
+Chrome 参数：`--ozone-platform=wayland --disable-gpu-sandbox --ignore-gpu-blocklist --render-node-override=/dev/dri/renderD129
+--enable-features=VaapiVideoDecoder,VaapiOnNvidiaGPUs,VaapiIgnoreDriverChecks,AcceleratedVideoDecodeLinuxGL,AcceleratedVideoDecodeLinuxZeroCopyGL,PlatformHEVCDecoderSupport`。
+未带 `--render-node-override` 时 Chrome 跳过 nvidia-drm 设备，GPU 进程不加载任何 VA 驱动（rustnv 与 C 驱动相同），回退软件解码。
+Chrome 建 AV1 / VP9 Profile 2 的 config 时 RTFormat 只给 YUV420，随后才创建 10-bit surface；rustnv 与 C 驱动一样把 RTFormat 当提示，按 surface 格式解码
+（`tests/va_rt420.c` 用 `LD_PRELOAD` 复现这个调用顺序，`tests/decode.py` 的 `av1-10`、`vp9-p2-10` 用例带上它）。
+
 性能（ffmpeg VA-API 解码吞吐，与系统里的 C 版 nvidia-vaapi-driver 对比）：
 
 | 片源 | rustnv | C 驱动 |
@@ -123,7 +176,7 @@ python3 tests/decode.py --codec av1    # 单个格式
 | H.264 4K60 | 216 fps，CPU 0.91 ms/帧 | 203 fps，1.35 ms/帧 |
 
 mpv 实时播放 H.264 4K60 两者都是 60 fps、0 丢帧。浏览器：Firefox 158 播放 H.264/HEVC/VP9/AV1 由 rustnv 解码；
-Chrome 156（关闭 GPU 沙箱）四种格式由 rustnv 解码，GPU 进程不加载 `libcuda`/`libnvcuvid`。
+Chrome 156（关闭 GPU 沙箱，带 `--render-node-override`，见下）四种格式由 rustnv 解码，GPU 进程不加载 `libcuda`/`libnvcuvid`。
 
 ## 编码回归
 
@@ -218,6 +271,7 @@ C 驱动作为对照有自己的失败（只记录，不影响退出码）：AV1
 测试：`tests/encode.py` 的 `zero_copy` 编译 `tests/dmabuf_import.c`（Vulkan 分配外部 NV12/P010/BGRA，线性与块线性）与 `tests/dmabuf_export.c`（libav VA-API 解码后导出再导入），逐字节对照同内容 `vaPutImage`、BGRA PSNR 门限、1000 次循环 RSS/fd。
 
 ### 遗留
+- 4:4:4 解码 surface 不能直接作编码输入（NVENC 要交错 chroma，copy engine 的 remap 一次只写一个平面）；4:4:4 编码输入仍走 `vaPutImage` / derive 上传。
 - BGRA 色彩转换仍在 CPU：RM 没有计算通道，copy engine 只能搬运。C 驱动这一路径本身在测试中失败。
 - 同步在 CPU 侧：解码完成与 copy engine 完成都由 CPU 等待，未做 GPU 侧 fence 串联。
 - 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。

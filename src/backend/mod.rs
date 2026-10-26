@@ -6,6 +6,7 @@ mod h264;
 mod hevc;
 mod vp9;
 
+use crate::Format;
 use nvrm::video::{
     self,
     session::{OutputAllocation, OutputAllocator, Session, SessionInfo, Target},
@@ -52,6 +53,16 @@ fn read<T: Copy>(bytes: &[u8], what: &str) -> Result<T, String> {
     Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
 }
 
+/// Reads the leading libva parameter struct `T` from a buffer the frontend validated to be one of
+/// `sizes` (the plain struct, or an extension struct that starts with it).
+fn read_prefix<T: Copy>(bytes: &[u8], sizes: &[usize], what: &str) -> Result<T, String> {
+    if !sizes.contains(&bytes.len()) || bytes.len() < size_of::<T>() {
+        return Err(format!("{what}: {} bytes, expected one of {sizes:?}", bytes.len()));
+    }
+    // SAFETY: libva parameter structs are plain integer data; any bit pattern is valid.
+    Ok(unsafe { std::ptr::read_unaligned(bytes.as_ptr().cast()) })
+}
+
 /// The codec half of a VA decoder: validates a picture and stages its parameters and references
 /// for the session's CodecDecoder.
 trait Frontend {
@@ -61,33 +72,54 @@ trait Frontend {
     fn release(&mut self, target: u32);
 }
 
+/// A surface's exported backing: one dma-buf holding every plane, named once per plane (the VA
+/// descriptor lists one object per plane, each a duplicate of the same buffer).
 pub struct Export {
-    pub fds: [OwnedFd; 2],
-    pub pitches: [u32; 2],
-    pub offsets: [u32; 2],
-    pub sizes: [u32; 2],
+    pub fds: Vec<OwnedFd>,
+    pub pitches: [u32; 3],
+    pub offsets: [u32; 3],
+    pub size: u32,
     pub modifier: u64,
 }
 impl Export {
     pub fn try_clone(&self) -> Result<Self, String> {
         Ok(Self {
-            fds: [
-                self.fds[0].try_clone().map_err(|e| e.to_string())?,
-                self.fds[1].try_clone().map_err(|e| e.to_string())?,
-            ],
+            fds: self
+                .fds
+                .iter()
+                .map(|fd| fd.try_clone().map_err(|e| e.to_string()))
+                .collect::<Result<_, _>>()?,
             pitches: self.pitches,
             offsets: self.offsets,
-            sizes: self.sizes,
+            size: self.size,
             modifier: self.modifier,
         })
     }
 }
 
+/// Plane geometry of the block-linear backing for a `format` surface of `width` x `height`:
+/// (pitch, plane offsets, size). Luma first; 4:2:0 formats continue with one CbCr plane, 4:4:4
+/// formats with separate Cb and Cr planes. Planes start at multiples of 64 rows.
+fn backing_layout(width: u32, height: u32, format: Format) -> (u32, [u32; 3], usize) {
+    let layout = SurfaceLayout::new(width, height, format.bytes_per_sample());
+    let plane = layout.chroma_offset as u32;
+    let offsets = [0, plane, if format.chroma_444 { 2 * plane } else { 0 }];
+    let size = if format.chroma_444 {
+        3 * plane as usize
+    } else {
+        layout.size
+    };
+    (layout.pitch, offsets, size.next_multiple_of(1 << 16))
+}
+
 struct OutputBacking {
     allocation: OutputAllocation,
-    layout: SurfaceLayout,
+    pitch: u32,
+    offsets: [u32; 3],
+    size: u32,
     width: u32,
     height: u32,
+    format: Format,
 }
 
 /// Stable VA surface storage, including surfaces exported before their first decode.
@@ -110,48 +142,31 @@ impl OutputPool {
         })
     }
 
-    pub fn export(&mut self, id: u32, width: u32, height: u32) -> Result<Export, String> {
+    pub fn export(&mut self, id: u32, width: u32, height: u32, format: Format) -> Result<Export, String> {
         if width == 0 || height == 0 || width > 4096 || height > 4096 {
-            return Err("NV12 output dimensions must be within 1..4096".into());
+            return Err("output dimensions must be within 1..4096".into());
         }
         if let Some(backing) = self.surfaces.get(&id) {
-            if (backing.width, backing.height) != (width, height) {
-                return Err("cannot change the dimensions of an existing surface backing".into());
+            if (backing.width, backing.height, backing.format) != (width, height, format) {
+                return Err("cannot change the dimensions or format of an existing surface backing".into());
             }
         } else {
-            let layout = SurfaceLayout::new(width, height, 1);
-            let allocation = self
-                .allocator
-                .allocate_zeroed(layout.size)
-                .map_err(|e| e.to_string())?;
+            let (pitch, offsets, size) = backing_layout(width, height, format);
+            let allocation = self.allocator.allocate_zeroed(size).map_err(|e| e.to_string())?;
             self.surfaces.insert(
                 id,
-                OutputBacking {
-                    allocation,
-                    layout,
-                    width,
-                    height,
-                },
+                OutputBacking { allocation, pitch, offsets, size: size as u32, width, height, format },
             );
         }
         let backing = &self.surfaces[&id];
-        let layout = backing.layout;
+        let fds = (0..format.planes())
+            .map(|_| backing.allocation.fd.try_clone().map_err(|e| e.to_string()))
+            .collect::<Result<_, _>>()?;
         Ok(Export {
-            fds: [
-                backing
-                    .allocation
-                    .fd
-                    .try_clone()
-                    .map_err(|e| e.to_string())?,
-                backing
-                    .allocation
-                    .fd
-                    .try_clone()
-                    .map_err(|e| e.to_string())?,
-            ],
-            pitches: [layout.pitch; 2],
-            offsets: [0, layout.chroma_offset as u32],
-            sizes: [layout.size as u32; 2],
+            fds,
+            pitches: [backing.pitch; 3],
+            offsets: backing.offsets,
+            size: backing.size,
             modifier: BLOCK_LINEAR,
         })
     }
@@ -169,6 +184,7 @@ pub struct Decoder {
     staging: Option<OutputAllocation>,
     width: u32,
     height: u32,
+    format: Format,
 }
 impl Decoder {
     /// `surfaces` is the number of VA render targets bound to the context (0 when the client binds
@@ -179,20 +195,21 @@ impl Decoder {
         width: u32,
         height: u32,
         surfaces: usize,
+        format: Format,
     ) -> Result<Self, String> {
         let dev = video::VideoDevice::open_on(Some(pci)).map_err(|e| e.to_string())?;
-        // This exact DRM modifier describes the verified pre-Blackwell NV12 layout.
+        // This exact DRM modifier describes the verified pre-Blackwell block-linear layout.
         if !matches!(dev.info.nvdec_class, 0xc4b0 | 0xc7b0 | 0xc9b0) {
             return Err(
-                "VA export requires verified Turing/Ampere/Ada block-linear NV12 layout".into(),
+                "VA export requires verified Turing/Ampere/Ada block-linear layout".into(),
             );
         }
         let class = dev.info.nvdec_class;
         let (front, codec) = match codec {
             Codec::H264 => h264::create(class, width, height)?,
-            Codec::Hevc => hevc::create(class, width, height)?,
-            Codec::Vp9 => vp9::create(class, width, height)?,
-            Codec::Av1 => av1::create(class, width, height)?,
+            Codec::Hevc => hevc::create(class, width, height, format)?,
+            Codec::Vp9 => vp9::create(class, width, height, format)?,
+            Codec::Av1 => av1::create(class, width, height, format)?,
         };
         // The session pool holds dpb_size() + 2 surfaces before the extra slots.
         let base = codec.dpb_size() + 2;
@@ -202,7 +219,7 @@ impl Decoder {
                 codec: codec.codec(),
                 max_width: width,
                 max_height: height,
-                bit_depth: 8,
+                bit_depth: format.bit_depth,
                 extra_output_slots: if surfaces == 0 {
                     32
                 } else {
@@ -220,6 +237,7 @@ impl Decoder {
             staging: None,
             width,
             height,
+            format,
         })
     }
     /// Decodes one picture into `picture.target` and waits for the hardware; runs on the worker.
@@ -248,16 +266,13 @@ impl Decoder {
             .pictures
             .get(&target)
             .ok_or("surface has not been decoded")?;
+        let raw = |i: usize| output.fds.get(i).map_or(-1, |fd| fd.as_raw_fd());
         let target = Target {
-            dmabuf_fd: [output.fds[0].as_raw_fd(), output.fds[1].as_raw_fd(), -1],
-            offset: [
-                u64::from(output.offsets[0]),
-                u64::from(output.offsets[1]),
-                0,
-            ],
-            pitch: [output.pitches[0], output.pitches[1], 0],
+            dmabuf_fd: [raw(0), raw(1), raw(2)],
+            offset: output.offsets.map(u64::from),
+            pitch: output.pitches,
             modifier: output.modifier,
-            format: video::FORMAT_NV12,
+            format: self.format.target(),
             width: self.width,
             height: self.height,
             acquire_fence_fd: -1,
@@ -266,15 +281,20 @@ impl Decoder {
             .copy_out_wait(id, &target)
             .map_err(|e| e.to_string())
     }
+    /// The picture's samples with rows packed at `width * bytes per sample`: the luma plane, then
+    /// the interleaved CbCr plane (4:2:0) or the Cb and Cr planes (4:4:4), see [`Format::packed`].
     pub fn readback(&mut self, target: u32) -> Result<Vec<u8>, String> {
         let id = *self
             .pictures
             .get(&target)
             .ok_or("surface has not been decoded")?;
+        let (w, rows) = (self.width as usize, self.height as usize);
+        let bps = self.format.bytes_per_sample() as usize;
         // LINEAR copy targets need a 4-byte-aligned pitch; the result is repacked to `width`.
-        let pitch = self.width.next_multiple_of(4);
-        let y = pitch as usize * self.height as usize;
-        let size = y + pitch as usize * self.height.div_ceil(2) as usize;
+        let pitch = (w * bps).next_multiple_of(4);
+        let plane = pitch * rows;
+        let chroma_rows = if self.format.chroma_444 { rows } else { rows.div_ceil(2) };
+        let size = plane + pitch * chroma_rows * (self.format.planes() - 1);
         if self.staging.is_none() {
             let alloc = self
                 .session
@@ -283,12 +303,15 @@ impl Decoder {
             self.staging = Some(alloc);
         }
         let alloc = self.staging.as_ref().unwrap();
+        let fd = alloc.fd.as_raw_fd();
+        let planes = self.format.planes();
+        let chroma_plane = pitch * chroma_rows;
         let t = Target {
-            dmabuf_fd: [alloc.fd.as_raw_fd(), alloc.fd.as_raw_fd(), -1],
-            offset: [0, y as u64, 0],
-            pitch: [pitch, pitch, 0],
+            dmabuf_fd: [fd, fd, if planes == 3 { fd } else { -1 }],
+            offset: [0, plane as u64, (plane + chroma_plane) as u64],
+            pitch: [pitch as u32; 3],
             modifier: 0,
-            format: video::FORMAT_NV12,
+            format: self.format.target(),
             width: self.width,
             height: self.height,
             acquire_fence_fd: -1,
@@ -297,14 +320,15 @@ impl Decoder {
             .copy_out_wait(id, &t)
             .map_err(|e| e.to_string())?;
         let map = alloc.map().map_err(|e| e.to_string())?;
-        let (w, rows) = (self.width as usize, self.height as usize);
-        let mut packed = vec![0; w * rows + w * rows.div_ceil(2)];
-        let (luma, chroma) = packed.split_at_mut(w * rows);
-        for (row, dest) in luma.chunks_exact_mut(w).enumerate() {
-            map.read_bytes(row * pitch as usize, dest).map_err(|e| e.to_string())?;
-        }
-        for (row, dest) in chroma.chunks_exact_mut(w).enumerate() {
-            map.read_bytes(y + row * pitch as usize, dest).map_err(|e| e.to_string())?;
+        let line = w * bps;
+        let mut packed = vec![0; self.format.packed(self.width, self.height).2];
+        let mut dest = packed.chunks_exact_mut(line);
+        let planes = [(0, rows), (plane, chroma_rows), (plane + chroma_plane, chroma_rows)];
+        for &(start, count) in &planes[..self.format.planes()] {
+            for row in 0..count {
+                let d = dest.next().ok_or("packed read-back is shorter than its planes")?;
+                map.read_bytes(start + row * pitch, d).map_err(|e| e.to_string())?;
+            }
         }
         Ok(packed)
     }

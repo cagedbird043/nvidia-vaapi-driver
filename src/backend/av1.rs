@@ -1,6 +1,6 @@
 //! AV1 VA headers and tile payloads drive the RM descriptor machinery directly.
 use super::{read, Frontend, Picture};
-use crate::va;
+use crate::{va, Format};
 use nvrm::video::{
     self,
     av1::{
@@ -29,6 +29,7 @@ struct Front {
     state: Rc<RefCell<State>>,
     width: u32,
     height: u32,
+    format: Format,
 }
 fn flag(word: u32, bit: u32) -> bool {
     word & (1 << bit) != 0
@@ -65,9 +66,16 @@ impl Frontend for Front {
         let qm = u32::from(unsafe { p.qmatrix_fields.value });
         let lr = u32::from(unsafe { p.loop_restoration_fields.value });
         let sg = unsafe { p.seg_info.segment_info_fields.value };
-        if p.profile != 0 || p.bit_depth_idx != 0 || flag(sf, 10) || !flag(sf, 12) || !flag(sf, 13)
+        if p.profile != 0
+            || u32::from(p.bit_depth_idx) * 2 + 8 != self.format.bit_depth
+            || flag(sf, 10)
+            || !flag(sf, 12)
+            || !flag(sf, 13)
         {
-            return Err("AV1 requires Profile 0, 8-bit 4:2:0 (no monochrome)".into());
+            return Err(format!(
+                "AV1 requires Profile 0, {}-bit 4:2:0 as the context's surfaces (no monochrome)",
+                self.format.bit_depth
+            ));
         }
         if flag(sf, 15) || unsafe { p.film_grain_info.film_grain_info_fields.value } & 1 != 0 {
             return Err("AV1 film grain is unsupported by the VA backend".into());
@@ -99,7 +107,7 @@ impl Frontend for Front {
         }
         let seq = SequenceHeader {
             seq_profile: 0,
-            bit_depth: 8,
+            bit_depth: self.format.bit_depth as u8,
             subsampling_x: true,
             subsampling_y: true,
             still_picture: flag(sf, 0),
@@ -316,6 +324,7 @@ struct VaCodec {
     pending: Option<Parameters>,
     bits: Option<Vec<u8>>,
     slot: usize,
+    format: Format,
 }
 fn invalid(s: &str) -> VideoError {
     VideoError::Invalid(s.into())
@@ -325,7 +334,7 @@ impl CodecDecoder for VaCodec {
         video::CODEC_AV1
     }
     fn bit_depth(&self) -> u32 {
-        8
+        self.format.bit_depth
     }
     fn dpb_size(&self) -> usize {
         8
@@ -361,7 +370,7 @@ impl CodecDecoder for VaCodec {
                 width: p.hdr.upscaled_width,
                 height: p.hdr.frame_height,
                 crop: [0, 0, p.hdr.upscaled_width, p.hdr.frame_height],
-                bit_depth: 8,
+                bit_depth: self.format.bit_depth,
                 keyframe: p.hdr.frame_type == 0,
                 full_range: p.seq.color_range,
                 ..Default::default()
@@ -411,14 +420,16 @@ pub(super) fn create(
     _class: u32,
     width: u32,
     height: u32,
+    format: Format,
 ) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
     let state = Rc::new(RefCell::new(State::default()));
-    let machinery = Av1Decoder::new(width, height, 8, &[]).map_err(|e| e.to_string())?;
+    let machinery = Av1Decoder::new(width, height, format.bit_depth, &[]).map_err(|e| e.to_string())?;
     Ok((
         Box::new(Front {
             state: state.clone(),
             width,
             height,
+            format,
         }),
         Box::new(VaCodec {
             state,
@@ -426,6 +437,7 @@ pub(super) fn create(
             pending: None,
             bits: None,
             slot: 0,
+            format,
         }),
     ))
 }

@@ -1,12 +1,14 @@
-//! HEVC Main: VA owns picture/reference state and display order; NVDEC parses slice payloads.
+//! HEVC Main, Main 10/12 and the 4:4:4 range-extension profiles: VA owns picture/reference state and
+//! display order; NVDEC parses slice payloads.
 //! All complete slice NALs are retained: NVDEC consumes list modifications, weights,
 //! CABAC headers, tile entry points and WPP directly, including multi-slice pictures.
 //! VA IQ matrices are raster-order; the RM scaling representation is diagonal-order.
-//! PCM, interlaced pictures, non-4:2:0 and non-8-bit surfaces are rejected.
+//! PCM, interlaced pictures and separate colour planes are rejected; a picture whose bit depth or chroma
+//! format differs from the context's surfaces is rejected.
 use super::{Frontend, Picture};
-use crate::va;
+use crate::{va, Format};
 use nvrm::video::{self, bits::{unescape, BitReader}, hevc::{self, codec::HevcDecoder, desc, ps}, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError};
-use std::{cell::RefCell, collections::HashMap, rc::Rc};
+use std::{cell::RefCell, collections::HashMap, mem::size_of, rc::Rc};
 
 fn invalid(s: impl Into<String>) -> VideoError { VideoError::Invalid(s.into()) }
 fn valid(r: &va::VAPictureHEVC) -> bool { r.picture_id != u32::MAX && r.flags & va::VA_PICTURE_HEVC_INVALID == 0 }
@@ -15,6 +17,8 @@ fn log2(v: u32) -> u32 { if v <= 1 { 0 } else { 32 - (v - 1).leading_zeros() } }
 struct Parameters {
     target: u32,
     pic: va::VAPictureParameterBufferHEVC,
+    /// Range-extension parameters, present when the client sent VAPictureParameterBufferHEVCExtension.
+    rext: Option<va::VAPictureParameterBufferHEVCRext>,
     iq: Option<va::VAIQMatrixBufferHEVC>,
     slices: Vec<va::VASliceParameterBufferHEVC>,
     first_nal: Vec<u8>,
@@ -25,11 +29,11 @@ struct State {
     surfaces: HashMap<u32, (usize, u8)>,
     refs: Vec<usize>,
 }
-struct Front { state: Rc<RefCell<State>>, width: u32, height: u32 }
+struct Front { state: Rc<RefCell<State>>, width: u32, height: u32, format: Format }
 struct VaCodec {
     state: Rc<RefCell<State>>, machinery: HevcDecoder,
     pending: Option<Parameters>, bits: Option<Vec<u8>>, slot: u8,
-    width: u32, height: u32,
+    width: u32, height: u32, format: Format,
 }
 
 impl Parameters {
@@ -55,9 +59,9 @@ impl Parameters {
             }
         }
         let sps = ps::Sps {
-            id: 0, profile_idc: 1, chroma_format_idc: 1, separate_colour_plane: false,
+            id: 0, profile_idc: 1, chroma_format_idc: f & 3, separate_colour_plane: false,
             width: p.pic_width_in_luma_samples.into(), height: p.pic_height_in_luma_samples.into(), conf_win: [0; 4],
-            bit_depth_luma: 8, bit_depth_chroma: 8, log2_max_poc_lsb: u32::from(p.log2_max_pic_order_cnt_lsb_minus4) + 4,
+            bit_depth_luma: u32::from(p.bit_depth_luma_minus8) + 8, bit_depth_chroma: u32::from(p.bit_depth_chroma_minus8) + 8, log2_max_poc_lsb: u32::from(p.log2_max_pic_order_cnt_lsb_minus4) + 4,
             max_dec_pic_buffering: u32::from(p.sps_max_dec_pic_buffering_minus1) + 1, max_num_reorder_pics: 0,
             log2_min_cb: u32::from(p.log2_min_luma_coding_block_size_minus3) + 3,
             log2_ctb: u32::from(p.log2_min_luma_coding_block_size_minus3) + 3 + u32::from(p.log2_diff_max_min_luma_coding_block_size),
@@ -69,6 +73,14 @@ impl Parameters {
             st_rps: vec![ps::StRps::default(); p.num_short_term_ref_pic_sets as usize],
             long_term_ref_pics_present: flag(h, 1), num_long_term_ref_pics_sps: p.num_long_term_ref_pic_sps.into(),
             temporal_mvp: flag(h, 2), strong_intra_smoothing: flag(f, 7),
+            rext: self.rext.map_or_else(ps::SpsRext::default, |r| {
+                let v = unsafe { r.range_extension_pic_fields.value };
+                ps::SpsRext {
+                    transform_skip_rotation: flag(v, 0), transform_skip_context: flag(v, 1), implicit_rdpcm: flag(v, 2),
+                    explicit_rdpcm: flag(v, 3), extended_precision: flag(v, 4), intra_smoothing_disabled: flag(v, 5),
+                    high_precision_offsets: flag(v, 6), persistent_rice_adaptation: flag(v, 7), cabac_bypass_alignment: flag(v, 8),
+                }
+            }),
         };
         let pps = ps::Pps {
             id: 0, sps_id: 0, dependent_slice_segments_enabled: flag(h, 5), output_flag_present: flag(h, 4),
@@ -87,6 +99,19 @@ impl Parameters {
             deblocking_override_enabled: flag(h, 8), deblocking_disabled: flag(h, 9), beta_offset_div2: p.pps_beta_offset_div2.into(), tc_offset_div2: p.pps_tc_offset_div2.into(),
             scaling_list: None, lists_modification_present: flag(h, 0), log2_parallel_merge_level: u32::from(p.log2_parallel_merge_level_minus2) + 2,
             slice_header_extension_present: flag(h, 10),
+            rext: self.rext.map_or_else(ps::PpsRext::default, |r| {
+                let v = unsafe { r.range_extension_pic_fields.value };
+                let list = flag(v, 10);
+                ps::PpsRext {
+                    log2_max_transform_skip_size: u32::from(r.log2_max_transform_skip_block_size_minus2) + 2,
+                    cross_component_prediction: flag(v, 9), chroma_qp_offset_list_enabled: list,
+                    diff_cu_chroma_qp_offset_depth: u32::from(r.diff_cu_chroma_qp_offset_depth),
+                    chroma_qp_offset_list_len: if list { u32::from(r.chroma_qp_offset_list_len_minus1) + 1 } else { 0 },
+                    log2_sao_offset_scale_luma: u32::from(r.log2_sao_offset_scale_luma),
+                    log2_sao_offset_scale_chroma: u32::from(r.log2_sao_offset_scale_chroma),
+                    cb_qp_offset_list: r.cb_qp_offset_list, cr_qp_offset_list: r.cr_qp_offset_list,
+                }
+            }),
         };
         (sps, pps)
     }
@@ -125,7 +150,8 @@ impl Parameters {
 
 impl CodecDecoder for VaCodec {
     fn codec(&self) -> u32 { video::CODEC_HEVC }
-    fn bit_depth(&self) -> u32 { 8 }
+    fn bit_depth(&self) -> u32 { self.format.bit_depth }
+    fn surface_layout(&self, w: u32, h: u32) -> video::SurfaceLayout { self.machinery.surface_layout(w, h) }
     fn dpb_size(&self) -> usize { 16 }
     fn allocate(&mut self, a: &mut dyn Allocator, w: u32, h: u32) -> VResult<()> { self.machinery.allocate(a, w, h) }
     fn surfaces_needed(&self, _: &[u8]) -> VResult<usize> { Ok(1) }
@@ -134,7 +160,7 @@ impl CodecDecoder for VaCodec {
         let Some(bitstream) = self.bits.take() else { return Ok(None); };
         let p = self.pending.as_ref().ok_or_else(|| invalid("missing HEVC VA parameters"))?;
         let keyframe = p.slices.iter().all(|s| (unsafe { s.LongSliceFlags.value } >> 2) & 3 == 2);
-        Ok(Some(Job::Decode(DecodeJob { info: PictureInfo { width: p.pic.pic_width_in_luma_samples.into(), height: p.pic.pic_height_in_luma_samples.into(), crop: [0, 0, self.width, self.height], bit_depth: 8, keyframe, ..Default::default() }, show: true, display_key: None, bitstream, readback: None })))
+        Ok(Some(Job::Decode(DecodeJob { info: PictureInfo { width: p.pic.pic_width_in_luma_samples.into(), height: p.pic.pic_height_in_luma_samples.into(), crop: [0, 0, self.width, self.height], bit_depth: self.format.bit_depth, keyframe, ..Default::default() }, show: true, display_key: None, bitstream, readback: None })))
     }
     fn build(&mut self, job: &DecodeJob, ctx: &BuildContext, d: &mut [u8]) -> VResult<Vec<u32>> {
         let p = self.pending.as_ref().ok_or_else(|| invalid("missing HEVC VA picture"))?;
@@ -172,7 +198,7 @@ impl CodecDecoder for VaCodec {
         let (skip, st_bits) = p.rps_skip(&sps, &pps)?;
         let h = unsafe { p.pic.slice_parsing_fields.value };
         let st = desc::PicState { stream_len: job.bitstream.len() as u32, idr: flag(h, 12), irap: flag(h, 11), curr_slot: self.slot, num_poc_total_curr: total as u32, list0, list1, diff, sw_hdr_skip_length: skip, num_bits_st_rps: st_bits, num_delta_pocs_ref: 0 };
-        let mut setup = desc::build(&sps, &pps, &st, &self.machinery.session_inputs(), desc::StockOpaque::observed(8))?;
+        let mut setup = desc::build(&sps, &pps, &st, &self.machinery.session_inputs(), desc::StockOpaque::observed(self.format.bit_depth))?;
         setup[0x72..0x74].copy_from_slice(&longterm.to_le_bytes());
         self.machinery.build_picture(ctx, d, &setup, &slots, hevc::CONTROL_PARAMS_BASE | if total > 0 { u32::from(list0[0]) << 7 } else { 0 })
     }
@@ -185,17 +211,31 @@ impl CodecDecoder for VaCodec {
     fn flush(&mut self) { self.pending = None; self.bits = None; let mut s = self.state.borrow_mut(); s.pending = None; s.refs.clear(); s.surfaces.clear(); }
 }
 
-pub(super) fn create(class: u32, width: u32, height: u32) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
+pub(super) fn create(class: u32, width: u32, height: u32, format: Format) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
     let state = Rc::new(RefCell::new(State::default()));
-    let machinery = HevcDecoder::new(class, width, height, 8, &[]).map_err(|e| e.to_string())?;
-    Ok((Box::new(Front { state: state.clone(), width, height }), Box::new(VaCodec { state, machinery, pending: None, bits: None, slot: 0, width, height })))
+    let machinery = HevcDecoder::with_format(class, width, height, format.bit_depth, format.chroma_444, &[]).map_err(|e| e.to_string())?;
+    Ok((Box::new(Front { state: state.clone(), width, height, format }), Box::new(VaCodec { state, machinery, pending: None, bits: None, slot: 0, width, height, format })))
+}
+
+/// The base picture parameters, and the range extension when the client sent the extension struct
+/// (FFmpeg does for every profile above Main 10).
+fn parameters(bytes: &[u8]) -> Result<(va::VAPictureParameterBufferHEVC, Option<va::VAPictureParameterBufferHEVCRext>), String> {
+    let pic = super::read_prefix(bytes, &[size_of::<va::VAPictureParameterBufferHEVC>(), size_of::<va::VAPictureParameterBufferHEVCExtension>()], "HEVC picture parameters")?;
+    let rext = (bytes.len() == size_of::<va::VAPictureParameterBufferHEVCExtension>()).then(|| {
+        // SAFETY: libva parameter structs are plain integer data; the range extension follows the base.
+        unsafe { std::ptr::read_unaligned(bytes[size_of::<va::VAPictureParameterBufferHEVC>()..].as_ptr().cast()) }
+    });
+    Ok((pic, rext))
 }
 
 impl Frontend for Front {
     fn stage(&mut self, picture: &Picture) -> Result<Vec<u8>, String> {
-        let pic: va::VAPictureParameterBufferHEVC = super::read(&picture.params, "HEVC picture parameters")?;
+        let (pic, rext) = parameters(&picture.params)?;
         let f = unsafe { pic.pic_fields.value };
-        if pic.bit_depth_luma_minus8 != 0 || pic.bit_depth_chroma_minus8 != 0 || f & 7 != 1 { return Err("HEVC requires 8-bit 4:2:0 without separate colour planes".into()); }
+        let chroma = if self.format.chroma_444 { 3 } else { 1 };
+        if u32::from(pic.bit_depth_luma_minus8) + 8 != self.format.bit_depth || u32::from(pic.bit_depth_chroma_minus8) + 8 != self.format.bit_depth || f & 7 != chroma {
+            return Err(format!("HEVC picture does not match the context's {}-bit 4:{}:{} surfaces", self.format.bit_depth, chroma + 1 - (chroma == 1) as u32, if chroma == 3 { 4 } else { 0 }));
+        }
         if f & 8 != 0 { return Err("HEVC PCM is unsupported".into()); }
         if pic.CurrPic.flags & (va::VA_PICTURE_HEVC_FIELD_PIC | va::VA_PICTURE_HEVC_BOTTOM_FIELD) != 0 { return Err("interlaced HEVC is unsupported".into()); }
         if pic.CurrPic.picture_id != picture.target { return Err("HEVC CurrPic is not render target".into()); }
@@ -209,7 +249,7 @@ impl Frontend for Front {
         let mut bits = Vec::with_capacity(picture.data.len() + picture.slices.len() * 3);
         let mut first_nal = Vec::new();
         for slice in &picture.slices {
-            let s: va::VASliceParameterBufferHEVC = super::read(&slice.param, "HEVC slice parameters")?;
+            let s: va::VASliceParameterBufferHEVC = super::read_prefix(&slice.param, &[size_of::<va::VASliceParameterBufferHEVC>(), size_of::<va::VASliceParameterBufferHEVCExtension>()], "HEVC slice parameters")?;
             let nal = &picture.data[slice.data.clone()];
             let prefix = if nal.starts_with(&[0, 0, 0, 1]) { 4 } else if nal.starts_with(&[0, 0, 1]) { 3 } else { 0 };
             let nal = &nal[prefix..];
@@ -233,7 +273,7 @@ impl Frontend for Front {
             if r.picture_id == picture.target { return Err("HEVC decode target is also a reference".into()); }
             refs.push(state.surfaces.get(&r.picture_id).ok_or_else(|| format!("unknown HEVC reference surface {}", r.picture_id))?.0);
         }
-        state.refs = refs; state.pending = Some(Parameters { target: picture.target, pic, iq, slices, first_nal }); Ok(bits)
+        state.refs = refs; state.pending = Some(Parameters { target: picture.target, pic, rext, iq, slices, first_nal }); Ok(bits)
     }
     fn release(&mut self, target: u32) { self.state.borrow_mut().surfaces.remove(&target); }
 }

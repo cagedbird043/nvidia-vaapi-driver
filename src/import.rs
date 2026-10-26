@@ -143,14 +143,16 @@ impl Dma {
         let modifiers = vec![DRM_FORMAT_MOD_LINEAR; buffers];
         Self::new(ext.pixel_format, ext.width, ext.height, fds, modifiers, planes)
     }
-    /// A decode surface's exported backing (one dma-buf, luma then CbCr at `offsets`).
-    pub fn from_backing(fd: &OwnedFd, size: u32, modifier: u64, pitch: u32, chroma_offset: u32, width: u32, height: u32) -> R<Self> {
+    /// A decode surface's exported backing (one dma-buf, luma then CbCr at `chroma_offset`); only the
+    /// 4:2:0 formats the encoder ingests.
+    pub fn from_backing(fourcc: u32, fd: &OwnedFd, size: u32, modifier: u64, pitch: u32, chroma_offset: u32, width: u32, height: u32) -> R<Self> {
+        let kind = Kind::of(fourcc).filter(|k| *k != Kind::Bgra).ok_or(INVALID)?;
         let planes = vec![
             Plane { object: 0, offset: 0, pitch },
             Plane { object: 0, offset: chroma_offset, pitch },
         ];
         let objects = vec![fd.try_clone().map_err(|_| FAILED)?];
-        let dma = Self { fourcc: NV12, kind: Kind::Nv12, width, height, objects, sizes: vec![size], modifiers: vec![modifier], planes };
+        let dma = Self { fourcc, kind, width, height, objects, sizes: vec![size], modifiers: vec![modifier], planes };
         dma.source()?;
         Ok(dma)
     }

@@ -1,7 +1,7 @@
-//! VP9 profile 0: VA owns surface identity and display order; RM retains the
+//! VP9 profiles 0 and 2 (8, 10 and 12-bit 4:2:0): VA owns surface identity and display order; RM retains the
 //! four probability contexts and parses the complete frame's compressed header.
 use super::{Frontend, Picture};
-use crate::va;
+use crate::{va, Format};
 use nvrm::video::{
     self, vp9::{VaPicture, Vp9Decoder}, Allocator, BuildContext, CodecDecoder,
     DecodeJob, Job, VResult, VideoError,
@@ -18,13 +18,15 @@ struct Front {
     state: Rc<RefCell<State>>,
     width: u32,
     height: u32,
+    format: Format,
 }
 impl Frontend for Front {
     fn stage(&mut self, picture: &Picture) -> Result<Vec<u8>, String> {
         let p: va::VADecPictureParameterBufferVP9 = super::read(&picture.params, "VP9 picture")?;
         let f = unsafe { p.pic_fields.value };
-        if p.profile != 0 || p.bit_depth != 8 || f & 3 != 3 {
-            return Err("VP9 supports only profile 0, 8-bit 4:2:0".into());
+        let profile = if self.format.bit_depth == 8 { 0 } else { 2 };
+        if p.profile != profile || u32::from(p.bit_depth) != self.format.bit_depth || f & 3 != 3 {
+            return Err(format!("VP9 picture (profile {}, {}-bit) does not match the context's {}-bit 4:2:0 surfaces", p.profile, p.bit_depth, self.format.bit_depth));
         }
         let (w, h) = (u32::from(p.frame_width), u32::from(p.frame_height));
         if w == 0 || h == 0 || w > self.width || h > self.height {
@@ -80,10 +82,11 @@ struct VaCodec {
     state: Rc<RefCell<State>>,
     decoder: Vp9Decoder,
     current: Option<(u32, u32, u32)>,
+    format: Format,
 }
 impl CodecDecoder for VaCodec {
     fn codec(&self) -> u32 { video::CODEC_VP9 }
-    fn bit_depth(&self) -> u32 { 8 }
+    fn bit_depth(&self) -> u32 { self.format.bit_depth }
     fn dpb_size(&self) -> usize { 8 }
     fn allocate(&mut self, a: &mut dyn Allocator, w: u32, h: u32) -> VResult<()> {
         self.decoder.allocate(a, w, h)
@@ -113,8 +116,8 @@ impl CodecDecoder for VaCodec {
         *self.state.borrow_mut() = State::default();
     }
 }
-pub(super) fn create(class: u32, width: u32, height: u32) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
+pub(super) fn create(class: u32, width: u32, height: u32, format: Format) -> Result<(Box<dyn Frontend>, Box<dyn CodecDecoder>), String> {
     let state = Rc::new(RefCell::new(State::default()));
-    Ok((Box::new(Front { state: state.clone(), width, height }),
-        Box::new(VaCodec { state, decoder: Vp9Decoder::new(class, width, height, 8), current: None })))
+    Ok((Box::new(Front { state: state.clone(), width, height, format }),
+        Box::new(VaCodec { state, decoder: Vp9Decoder::new(class, width, height, format.bit_depth), current: None, format })))
 }

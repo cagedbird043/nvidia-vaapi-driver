@@ -20,28 +20,152 @@ const FAILED: VAStatus = VA_STATUS_ERROR_OPERATION_FAILED as VAStatus;
 const UNIMPL: VAStatus = VA_STATUS_ERROR_UNIMPLEMENTED as VAStatus;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
 const P010: u32 = u32::from_le_bytes(*b"P010");
+const P012: u32 = u32::from_le_bytes(*b"P012");
+const P016: u32 = u32::from_le_bytes(*b"P016");
 const YUV444P: u32 = u32::from_le_bytes(*b"444P");
 const Q416: u32 = u32::from_le_bytes(*b"Q416");
 const ENC_MAX_DIM: u32 = 8192;
 const MAX_DIM: u32 = 4096;
-const PROFILES: [VAProfile; 7] = [
-    VAProfileH264Baseline,
+/// Decode profiles, as the C driver reports them on NVDEC hardware that decodes them all (VP9 and
+/// AV1 profiles above 0 4:2:0, and the 4:2:2 profiles, do not exist on NVDEC).
+const PROFILES: [VAProfile; 12] = [
     VAProfileH264ConstrainedBaseline,
     VAProfileH264Main,
     VAProfileH264High,
     VAProfileHEVCMain,
+    VAProfileHEVCMain10,
+    VAProfileHEVCMain12,
+    VAProfileHEVCMain444,
+    VAProfileHEVCMain444_10,
+    VAProfileHEVCMain444_12,
     VAProfileVP9Profile0,
+    VAProfileVP9Profile2,
     VAProfileAV1Profile0,
 ];
 fn codec_of(profile: VAProfile) -> R<backend::Codec> {
     use backend::Codec::*;
     Ok(match profile {
-        va::VAProfileH264Baseline | va::VAProfileH264ConstrainedBaseline | va::VAProfileH264Main | va::VAProfileH264High => H264,
-        va::VAProfileHEVCMain => Hevc,
-        va::VAProfileVP9Profile0 => Vp9,
+        va::VAProfileH264ConstrainedBaseline | va::VAProfileH264Main | va::VAProfileH264High => H264,
+        va::VAProfileHEVCMain | va::VAProfileHEVCMain10 | va::VAProfileHEVCMain12 | va::VAProfileHEVCMain444 | va::VAProfileHEVCMain444_10 | va::VAProfileHEVCMain444_12 => Hevc,
+        va::VAProfileVP9Profile0 | va::VAProfileVP9Profile2 => Vp9,
         va::VAProfileAV1Profile0 => Av1,
         _ => return Err(VA_STATUS_ERROR_UNSUPPORTED_PROFILE as VAStatus),
     })
+}
+/// Render-target formats a decode profile accepts, as the C driver reports them in VAConfigAttribRTFormat.
+fn profile_rt(profile: VAProfile) -> u32 {
+    let (c420, c444) = (VA_RT_FORMAT_YUV420, VA_RT_FORMAT_YUV444);
+    match profile {
+        va::VAProfileHEVCMain10 => c420 | VA_RT_FORMAT_YUV420_10,
+        va::VAProfileHEVCMain12 | va::VAProfileVP9Profile2 => c420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV420_12,
+        va::VAProfileAV1Profile0 => c420 | VA_RT_FORMAT_YUV420_10,
+        va::VAProfileHEVCMain444 => c420 | c444,
+        va::VAProfileHEVCMain444_10 => c420 | VA_RT_FORMAT_YUV420_10 | c444 | VA_RT_FORMAT_YUV444_10,
+        va::VAProfileHEVCMain444_12 => c420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV420_12 | c444 | VA_RT_FORMAT_YUV444_10 | VA_RT_FORMAT_YUV444_12,
+        _ => c420,
+    }
+}
+
+/// Pixel format of a decode surface. 10/12-bit samples sit in the high bits of 16-bit containers
+/// (P010/P012, Q416), exactly as the engine writes them; 12-bit 4:2:0 is P012, 4:4:4 above 8 bits
+/// is Q416 (three planes), as in the C driver.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Format {
+    pub fourcc: u32,
+    pub bit_depth: u32,
+    pub chroma_444: bool,
+}
+impl Format {
+    pub const NV12: Self = Self { fourcc: NV12, bit_depth: 8, chroma_444: false };
+    /// The format of surfaces created with exactly this `VA_RT_FORMAT_*`.
+    pub fn of_rt(rt: u32) -> Option<Self> {
+        let (fourcc, bit_depth, chroma_444) = match rt {
+            VA_RT_FORMAT_YUV420 => (NV12, 8, false),
+            VA_RT_FORMAT_YUV420_10 => (P010, 10, false),
+            VA_RT_FORMAT_YUV420_12 => (P012, 12, false),
+            VA_RT_FORMAT_YUV444 => (YUV444P, 8, true),
+            VA_RT_FORMAT_YUV444_10 => (Q416, 10, true),
+            VA_RT_FORMAT_YUV444_12 => (Q416, 12, true),
+            _ => return None,
+        };
+        Some(Self { fourcc, bit_depth, chroma_444 })
+    }
+    /// The container a surface of this fourcc holds (the depth of 16-bit formats is the lowest it carries).
+    pub fn of_fourcc(fourcc: u32) -> Option<Self> {
+        match fourcc {
+            NV12 => Some(Self::NV12),
+            P010 => Self::of_rt(VA_RT_FORMAT_YUV420_10),
+            P012 => Self::of_rt(VA_RT_FORMAT_YUV420_12),
+            YUV444P => Self::of_rt(VA_RT_FORMAT_YUV444),
+            Q416 => Self::of_rt(VA_RT_FORMAT_YUV444_10),
+            _ => None,
+        }
+    }
+    pub fn rt(self) -> u32 {
+        match (self.chroma_444, self.bit_depth) {
+            (false, 8) => VA_RT_FORMAT_YUV420,
+            (false, 10) => VA_RT_FORMAT_YUV420_10,
+            (false, _) => VA_RT_FORMAT_YUV420_12,
+            (true, 8) => VA_RT_FORMAT_YUV444,
+            (true, 10) => VA_RT_FORMAT_YUV444_10,
+            (true, _) => VA_RT_FORMAT_YUV444_12,
+        }
+    }
+    pub fn bytes_per_sample(self) -> u32 {
+        if self.bit_depth > 8 { 2 } else { 1 }
+    }
+    /// Planes in memory: luma + interleaved CbCr, or luma + Cb + Cr.
+    pub fn planes(self) -> usize {
+        if self.chroma_444 { 3 } else { 2 }
+    }
+    /// The RM copy-out target format.
+    pub fn target(self) -> u32 {
+        match (self.chroma_444, self.bit_depth) {
+            (false, 8) => nvrm::video::FORMAT_NV12,
+            (false, 10) => nvrm::video::FORMAT_P010,
+            (false, _) => nvrm::video::FORMAT_P016,
+            (true, 8) => nvrm::video::FORMAT_YUV444P,
+            (true, _) => nvrm::video::FORMAT_YUV444P16,
+        }
+    }
+    /// Rows of each chroma plane for `height` luma rows.
+    pub fn chroma_rows(self, height: u32) -> u32 {
+        if self.chroma_444 { height } else { height.div_ceil(2) }
+    }
+    /// CPU layout of a tightly packed picture: (pitch, plane offsets, total size).
+    pub fn packed(self, width: u32, height: u32) -> (u32, [u32; 3], usize) {
+        let pitch = width * self.bytes_per_sample();
+        let luma = pitch * height;
+        let chroma = pitch * self.chroma_rows(height);
+        let offsets = [0, luma, if self.chroma_444 { luma + chroma } else { 0 }];
+        (pitch, offsets, (luma + chroma * (self.planes() as u32 - 1)) as usize)
+    }
+    /// DRM format of each plane as the C driver describes them in separate layers.
+    pub fn layer_formats(self) -> [u32; 3] {
+        let (r8, rg88) = (u32::from_le_bytes(*b"R8  "), u32::from_le_bytes(*b"RG88"));
+        let (r16, rg1616) = (u32::from_le_bytes(*b"R16 "), u32::from_le_bytes(*b"RG32"));
+        match (self.chroma_444, self.bytes_per_sample()) {
+            (false, 1) => [r8, rg88, 0],
+            (false, _) => [r16, rg1616, 0],
+            (true, 1) => [r8; 3],
+            (true, _) => [r16; 3],
+        }
+    }
+    /// `VADRMPRIMESurfaceDescriptor::fourcc`: P012 is described as P016 (the same two-plane layout
+    /// of 16-bit containers, which more importers accept), as in the C driver.
+    pub fn descriptor_fourcc(self) -> u32 {
+        if self.fourcc == P012 { P016 } else { self.fourcc }
+    }
+    /// The single DRM format of a composed layer, if one exists (Q416 has none).
+    pub fn composed_format(self) -> Option<u32> {
+        match self.fourcc {
+            NV12 => Some(NV12),
+            P010 => Some(P010),
+            P012 => Some(P016),
+            YUV444P => Some(u32::from_le_bytes(*b"YU24")),
+            _ => None,
+        }
+    }
 }
 /// Element sizes of the codec's picture, IQ-matrix and slice parameter buffers.
 fn parameter_sizes(codec: backend::Codec) -> (usize, Option<usize>, usize) {
@@ -127,13 +251,13 @@ fn gpu<T>(r: Result<T, String>) -> R<T> {
     })
 }
 impl Worker {
-    fn new(codec: backend::Codec, pci: [u32; 4], w: u32, h: u32, surfaces: usize) -> R<Self> {
+    fn new(codec: backend::Codec, pci: [u32; 4], w: u32, h: u32, surfaces: usize, format: Format) -> R<Self> {
         let (tx, rx) = mpsc::channel();
         let (ready_tx, ready_rx) = mpsc::channel();
         let join = thread::Builder::new()
             .name("rustnv-nvdec".into())
             .spawn(move || {
-                let mut decoder = match backend::Decoder::new(codec, pci, w, h, surfaces) {
+                let mut decoder = match backend::Decoder::new(codec, pci, w, h, surfaces, format) {
                     Ok(d) => {
                         let _ = ready_tx.send(Ok(()));
                         d
@@ -202,7 +326,7 @@ impl Drop for Worker {
     }
 }
 enum OutputCommand {
-    Export(u32, u32, u32, mpsc::Sender<Result<backend::Export, String>>),
+    Export(u32, u32, u32, Format, mpsc::Sender<Result<backend::Export, String>>),
     Release(u32),
     Quit,
 }
@@ -231,8 +355,8 @@ impl OutputWorker {
                 };
                 while let Ok(command) = rx.recv() {
                     match command {
-                        OutputCommand::Export(id, w, h, reply) => {
-                            let _ = reply.send(pool.export(id, w, h));
+                        OutputCommand::Export(id, w, h, format, reply) => {
+                            let _ = reply.send(pool.export(id, w, h, format));
                         }
                         OutputCommand::Release(id) => pool.release(id),
                         OutputCommand::Quit => break,
@@ -254,10 +378,10 @@ impl OutputWorker {
             }
         }
     }
-    fn export(&self, id: u32, w: u32, h: u32) -> R<backend::Export> {
+    fn export(&self, id: u32, w: u32, h: u32, format: Format) -> R<backend::Export> {
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(OutputCommand::Export(id, w, h, tx))
+            .send(OutputCommand::Export(id, w, h, format, tx))
             .map_err(|_| FAILED)?;
         gpu(rx.recv().map_err(|_| FAILED)?)
     }
@@ -272,6 +396,10 @@ impl Drop for OutputWorker {
 }
 struct Context {
     codec: backend::Codec,
+    format: Format,
+    /// The config named no render-target format and the context's surfaces did not settle one
+    /// (VP9 profile 2, AV1): the decoder is rebuilt when a picture targets a surface of another format.
+    adaptive: bool,
     worker: Arc<Worker>,
     width: u32,
     height: u32,
@@ -316,7 +444,8 @@ struct Driver {
     /// The NVIDIA GPU behind the DRM device libva opened for this display.
     pci: [u32; 4],
     next: u32,
-    configs: HashMap<u32, VAProfile>,
+    /// Decode configs: profile and the render-target formats the client asked for (0: unspecified).
+    configs: HashMap<u32, (VAProfile, u32)>,
     enc_configs: HashMap<u32, (VAProfile, u32)>,
     enc_contexts: HashMap<u32, encode::Session>,
     surfaces: HashMap<u32, Surface>,
@@ -368,10 +497,11 @@ impl Driver {
         let s = self.surface(id)?;
         if s.output.is_none() {
             let (w, h) = (s.width, s.height);
+            let format = Format::of_fourcc(s.fourcc).ok_or(FAILED)?;
             if self.output_worker.is_none() {
                 self.output_worker = Some(OutputWorker::new(self.pci)?);
             }
-            let output = self.output_worker.as_ref().unwrap().export(id, w, h)?;
+            let output = self.output_worker.as_ref().unwrap().export(id, w, h, format)?;
             let s = self.surfaces.get_mut(&id).unwrap();
             s.output = Some(output);
             s.output_dirty = s.decode.is_some();
@@ -411,7 +541,7 @@ impl Driver {
         let s = self.surfaces.get_mut(&id).unwrap();
         if s.backing.is_none() {
             let o = s.output.as_ref().ok_or(FAILED)?;
-            let dma = import::Dma::from_backing(&o.fds[0], o.sizes[0], o.modifier, o.pitches[0], o.offsets[1], s.width, s.height)?;
+            let dma = import::Dma::from_backing(s.fourcc, &o.fds[0], o.size, o.modifier, o.pitches[0], o.offsets[1], s.width, s.height)?;
             s.backing = Some(Arc::new(dma));
         }
         Ok(Some((s.backing.clone().unwrap(), s.pending())))
@@ -453,9 +583,9 @@ fn supported(p: VAProfile, e: VAEntrypoint) -> R {
         Ok(())
     }
 }
-fn attribute(t: VAConfigAttribType) -> u32 {
+fn attribute(profile: VAProfile, t: VAConfigAttribType) -> u32 {
     match t {
-        va::VAConfigAttribRTFormat => VA_RT_FORMAT_YUV420,
+        va::VAConfigAttribRTFormat => profile_rt(profile),
         va::VAConfigAttribDecSliceMode => VA_DEC_SLICE_MODE_NORMAL,
         va::VAConfigAttribDecProcessing => VA_DEC_PROCESSING_NONE,
         va::VAConfigAttribMaxPictureWidth | va::VAConfigAttribMaxPictureHeight => MAX_DIM,
@@ -480,7 +610,7 @@ unsafe fn invoke_unlocked(ctx: VADriverContextP, f: impl FnOnce(&Mutex<Driver>) 
 fn lock(m: &Mutex<Driver>) -> R<MutexGuard<'_, Driver>> {
     m.lock().map_err(|_| FAILED)
 }
-/// NV12 contents of a surface once its latest decode completed; waits without the driver lock.
+/// Packed contents (see [`Format::packed`]) of a surface once its latest decode completed; waits without the driver lock.
 fn readback(m: &Mutex<Driver>, id: u32) -> R<Vec<u8>> {
     let (worker, decode) = {
         let d = lock(m)?;
@@ -509,34 +639,33 @@ callback!(query_entrypoints(ctx, p: VAProfile, list: *mut VAEntrypoint, n: *mut 
 });
 callback!(get_config_attributes(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32) |_d| {
     if e == VAEntrypointEncSlice { return encode::get_attributes(p, attrs, n); }
-    supported(p, e)?; for i in 0..count(n)? { let a = array(attrs, count(n)?)?[i]; (*attrs.add(i)).value = attribute(a.type_); } Ok(())
+    supported(p, e)?; for i in 0..count(n)? { let a = array(attrs, count(n)?)?[i]; (*attrs.add(i)).value = attribute(p, a.type_); } Ok(())
 });
 callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32, id: *mut u32) |d| {
     if e == VAEntrypointEncSlice { return encode::create_config(d, p, attrs, n, id); }
     supported(p, e)?; if id.is_null() { return Err(INVALID); }
+    let mut rt = 0;
     for a in array(attrs, count(n)?)? {
-        let value = attribute(a.type_);
-        if value == VA_ATTRIB_NOT_SUPPORTED || a.value != value { return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus); }
+        let value = attribute(p, a.type_);
+        // The client names the render-target formats it will use; they must be among the profile's.
+        let acceptable = if a.type_ == va::VAConfigAttribRTFormat { a.value & !value == 0 && a.value != 0 } else { a.value == value };
+        if value == VA_ATTRIB_NOT_SUPPORTED || !acceptable { return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus); }
+        if a.type_ == va::VAConfigAttribRTFormat { rt = a.value; }
     }
-    let key = d.id()?; d.configs.insert(key, p); out(id, key)
+    let key = d.id()?; d.configs.insert(key, (p, rt)); out(id, key)
 });
 callback!(destroy_config(ctx, id: u32) |d| { if d.enc_configs.remove(&id).is_some() { return Ok(()); } d.configs.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?; Ok(()) });
 callback!(query_config(ctx, id: u32, p: *mut VAProfile, e: *mut VAEntrypoint, attrs: *mut VAConfigAttrib, n: *mut i32) |d| {
     if let Some(&(profile, _)) = d.enc_configs.get(&id) { return encode::query_config(profile, p, e, attrs, n); }
-    let profile = *d.configs.get(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?;
+    let (profile, _) = *d.configs.get(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?;
     if p.is_null() || e.is_null() || attrs.is_null() || n.is_null() { return Err(INVALID); }
     out(p, profile)?; out(e, VAEntrypointVLD)?;
-    out(attrs, VAConfigAttrib { type_: VAConfigAttribRTFormat, value: VA_RT_FORMAT_YUV420 })?; out(n, 1)
+    out(attrs, VAConfigAttrib { type_: VAConfigAttribRTFormat, value: profile_rt(profile) })?; out(n, 1)
 });
 /// Surface creation parameters from `VASurfaceAttrib`: the picture format, and the client's DRM
 /// PRIME buffer when the surfaces wrap one (dimensions then come from the descriptor).
 unsafe fn surface_attributes(attrs: &[VASurfaceAttrib], format: u32, w: &mut u32, h: &mut u32) -> R<(u32, Option<Arc<import::Dma>>)> {
-    let mut fourcc = match format {
-        VA_RT_FORMAT_YUV420_10 => P010,
-        VA_RT_FORMAT_YUV444 => YUV444P,
-        VA_RT_FORMAT_YUV444_10 => Q416,
-        _ => NV12,
-    };
+    let mut fourcc = Format::of_rt(format).map_or(NV12, |f| f.fourcc);
     let (mut memory, mut descriptor) = (0, ptr::null_mut());
     for a in attrs {
         if a.flags & VA_SURFACE_ATTRIB_SETTABLE == 0 { continue; }
@@ -578,7 +707,7 @@ pub(crate) fn offered_memory_types() -> u32 {
     VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 | legacy
 }
 callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32, n: u32, attrs: *mut VASurfaceAttrib, na: u32) |d| {
-    if format & !(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV444 | VA_RT_FORMAT_YUV444_10 | VA_RT_FORMAT_RGB32) != 0 || format == 0 {
+    if format & !(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV420_12 | VA_RT_FORMAT_YUV444 | VA_RT_FORMAT_YUV444_10 | VA_RT_FORMAT_YUV444_12 | VA_RT_FORMAT_RGB32) != 0 || format == 0 {
         return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus);
     }
     if n == 0 || surfaces.is_null() { return Err(INVALID); }
@@ -641,10 +770,56 @@ callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: 
     if flags & !(VA_PROGRESSIVE as i32) != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     let targets: HashSet<u32> = array(targets, count(n)?)?.iter().copied().collect();
     for target in &targets { let s = d.surface(*target)?; if s.width < w as u32 || s.height < h as u32 { return Err(INVALID); } }
-    let codec = codec_of(d.configs[&config])?;
-    let worker = Arc::new(Worker::new(codec, d.pci, w as u32, h as u32, targets.len())?); let key = d.id()?;
-    d.contexts.insert(key, Context { codec, worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
+    let (profile, rt) = d.configs[&config];
+    let codec = codec_of(profile)?;
+    let (format, adaptive) = context_format(d, profile, rt, &targets)?;
+    let worker = Arc::new(Worker::new(codec, d.pci, w as u32, h as u32, targets.len(), format)?); let key = d.id()?;
+    d.contexts.insert(key, Context { codec, format, adaptive, worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
 });
+/// The surface format a decode context produces. The profile fixes it, except VP9 profile 2 and
+/// AV1 (10 or 12-bit streams): then the config's render-target format decides, else the format of
+/// the context's surfaces, else the profile's usual depth (VP9 profile 2: 10-bit; AV1: 8-bit), as
+/// the C driver does.
+fn context_format(d: &Driver, profile: VAProfile, rt: u32, targets: &HashSet<u32>) -> R<(Format, bool)> {
+    let mut adaptive = false;
+    let fixed = match profile {
+        va::VAProfileHEVCMain10 => VA_RT_FORMAT_YUV420_10,
+        va::VAProfileHEVCMain12 => VA_RT_FORMAT_YUV420_12,
+        va::VAProfileHEVCMain444 => VA_RT_FORMAT_YUV444,
+        va::VAProfileHEVCMain444_10 => VA_RT_FORMAT_YUV444_10,
+        va::VAProfileHEVCMain444_12 => VA_RT_FORMAT_YUV444_12,
+        va::VAProfileVP9Profile2 | va::VAProfileAV1Profile0 => {
+            // The config's RTFormat is only a hint (Chrome asks for YUV420 and then creates 10-bit surfaces, as the C
+            // driver tolerates): the decoder follows the surfaces, and is rebuilt when a picture targets another format.
+            adaptive = true;
+            let from_targets = || targets.iter().filter_map(|t| d.surfaces.get(t)).find_map(|s| Format::of_fourcc(s.fourcc)).map(Format::rt);
+            let wanted = |mask: u32| [VA_RT_FORMAT_YUV420_12, VA_RT_FORMAT_YUV420_10, VA_RT_FORMAT_YUV420].into_iter().find(|f| mask & f != 0);
+            from_targets().and_then(wanted).or_else(|| wanted(rt)).unwrap_or(VA_RT_FORMAT_YUV420)
+        }
+        _ => VA_RT_FORMAT_YUV420,
+    };
+    let format = Format::of_rt(fixed).ok_or(INVALID)?;
+    for t in targets.iter().filter(|_| !adaptive) {
+        // 16-bit containers hold any depth above 8: P010 surfaces serve 10-bit streams, P012 12-bit ones.
+        let s = d.surface(*t)?;
+        if Format::of_fourcc(s.fourcc).is_none_or(|f| f.fourcc != format.fourcc || f.chroma_444 != format.chroma_444) {
+            return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
+        }
+    }
+    Ok((format, adaptive))
+}
+/// Rebuilds an adaptive context's decoder for the format of the surface a picture targets.
+fn retarget(d: &mut Driver, id: u32, target: u32) -> R {
+    let fourcc = d.surface(target)?.fourcc;
+    let c = d.context(id)?;
+    if !c.adaptive || fourcc == c.format.fourcc { return Ok(()); }
+    let format = Format::of_fourcc(fourcc).filter(|f| !f.chroma_444).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
+    let worker = Arc::new(Worker::new(c.codec, d.pci, c.width, c.height, c.targets.len(), format)?);
+    let c = d.contexts.get_mut(&id).unwrap();
+    c.worker = worker;
+    c.format = format;
+    Ok(())
+}
 callback!(destroy_context(ctx, id: u32) |d| {
     if d.enc_contexts.remove(&id).is_some() {
         d.buffers.retain(|_, b| b.context != Some(id));
@@ -657,10 +832,13 @@ callback!(destroy_context(ctx, id: u32) |d| {
 fn buffer_shape(codec: backend::Codec, kind: VABufferType, size: u32) -> bool {
     let (pic, iq, slice) = parameter_sizes(codec);
     let size = size as usize;
+    // HEVC clients above Main 10 send the range-extension structs, which start with the base ones.
+    let extended = codec == backend::Codec::Hevc;
+    let (pic_ext, slice_ext) = (size_of::<VAPictureParameterBufferHEVCExtension>(), size_of::<VASliceParameterBufferHEVCExtension>());
     match kind {
-        va::VAPictureParameterBufferType => size == pic,
+        va::VAPictureParameterBufferType => size == pic || extended && size == pic_ext,
         va::VAIQMatrixBufferType => iq == Some(size),
-        va::VASliceParameterBufferType => size == slice,
+        va::VASliceParameterBufferType => size == slice || extended && size == slice_ext,
         va::VASliceDataBufferType => size != 0,
         _ => false,
     }
@@ -698,8 +876,10 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
         if busy(d, target) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
         return d.enc_contexts.get_mut(&id).unwrap().begin(target);
     }
+    d.surface(target)?; d.context(id)?;
+    if d.context(id)?.frame.is_none() { retarget(d, id, target)?; }
     let s = d.surface(target)?; let c = d.context(id)?;
-    if s.import.is_some() { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
+    if s.import.is_some() || s.fourcc != c.format.fourcc { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
     if c.frame.is_some() { return Err(INVALID); }
     if (!c.targets.is_empty() && !c.targets.contains(&target)) || s.width < c.width || s.height < c.height { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
     if s.owner.is_some_and(|owner| owner != id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
@@ -824,69 +1004,64 @@ callback!(query_status(ctx, id: u32, status: *mut VASurfaceStatus) |d| {
     out(status, if rendering { VASurfaceRendering } else { VASurfaceReady })
 });
 callback!(query_surface_error(ctx, id: u32, _status: VAStatus, _info: *mut *mut c_void) |d| { d.surface(id)?; Err(UNIMPL) });
-fn image_format() -> VAImageFormat {
+/// `VAImageFormat` of `fourcc`, with the C driver's bits per pixel.
+fn image_format(fourcc: u32) -> VAImageFormat {
     VAImageFormat {
-        fourcc: NV12,
+        fourcc,
         byte_order: VA_LSB_FIRST,
-        bits_per_pixel: 12,
+        bits_per_pixel: match fourcc {
+            P010 | P012 | P016 | YUV444P => 24,
+            Q416 => 48,
+            _ => 12,
+        },
         ..Default::default()
     }
 }
+/// Image formats for surfaces: what decode surfaces read back as and encoder inputs upload as.
+pub(crate) const IMAGE_FORMATS: [u32; 6] = [NV12, P010, P012, P016, YUV444P, Q416];
 fn new_input(fourcc: u32, w: u32, h: u32) -> encode::Input {
-    let wide = matches!(fourcc, P010 | Q416);
-    let full = matches!(fourcc, YUV444P | Q416);
-    let pitch = w as usize * if wide { 2 } else { 1 };
-    let l = pitch * h as usize;
-    let size = if full { l * 3 } else { l * 3 / 2 };
+    let format = packed_format(fourcc);
+    let (pitch, offsets, size) = format.packed(w, h);
     encode::Input {
         bytes: vec![0; size],
         fourcc,
-        pitch,
-        offsets: [0, l, if full { l * 2 } else { 0 }],
+        pitch: pitch as usize,
+        offsets: offsets.map(|v| v as usize),
     }
 }
+/// The CPU layout of an image of `fourcc` (P016 is laid out like P010).
+fn packed_format(fourcc: u32) -> Format {
+    Format::of_fourcc(if fourcc == P016 { P010 } else { fourcc }).unwrap_or(Format::NV12)
+}
 fn input_image(d: &mut Driver, input: &encode::Input, w: u32, h: u32) -> R<VAImage> {
-    let mut image = allocate_image(d, w, h)?;
-    image.format.fourcc = input.fourcc;
-    image.format.bits_per_pixel = match input.fourcc {
-        P010 | YUV444P => 24,
-        Q416 => 48,
-        _ => 12,
-    };
-    image.num_planes = if matches!(input.fourcc, YUV444P | Q416) {
-        3
-    } else {
-        2
-    };
-    image.pitches = [
-        input.pitch as u32,
-        input.pitch as u32,
-        if image.num_planes == 3 {
-            input.pitch as u32
-        } else {
-            0
-        },
-    ];
+    let mut image = allocate_image(d, w, h, input.fourcc)?;
+    let format = packed_format(input.fourcc);
+    image.num_planes = format.planes() as u32;
+    image.pitches = [input.pitch as u32; 3];
+    if !format.chroma_444 {
+        image.pitches[2] = 0;
+    }
     image.offsets = input.offsets.map(|v| v as u32);
     image.data_size = input.bytes.len() as u32;
     d.images.insert(image.image_id, image);
     Ok(image)
 }
-fn allocate_image(d: &mut Driver, w: u32, h: u32) -> R<VAImage> {
+fn allocate_image(d: &mut Driver, w: u32, h: u32, fourcc: u32) -> R<VAImage> {
     dimensions(w, h, ENC_MAX_DIM)?;
-    let size = w * h * 3 / 2;
+    let (pitch, offsets, size) = packed_format(fourcc).packed(w, h);
     let id = d.id()?;
     let buffer = d.id()?;
+    let format = packed_format(fourcc);
     let image = VAImage {
         image_id: id,
-        format: image_format(),
+        format: image_format(fourcc),
         buf: buffer,
         width: w as u16,
         height: h as u16,
-        data_size: size,
-        num_planes: 2,
-        pitches: [w, w, 0],
-        offsets: [0, w * h, 0],
+        data_size: size as u32,
+        num_planes: format.planes() as u32,
+        pitches: [pitch, pitch, if format.chroma_444 { pitch } else { 0 }],
+        offsets,
         ..Default::default()
     };
     d.buffers.insert(
@@ -894,7 +1069,7 @@ fn allocate_image(d: &mut Driver, w: u32, h: u32) -> R<VAImage> {
         Buffer {
             context: None,
             kind: VAImageBufferType,
-            size,
+            size: size as u32,
             count: 1,
             bytes: Vec::new(),
             mapped: false,
@@ -912,24 +1087,43 @@ callback!(create_image(ctx, format: *mut VAImageFormat, w: i32, h: i32, image: *
 callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
     if image.is_null() { return Err(INVALID); }
     if let Some(value) = encode::derive_input_image(&mut *lock(m)?, surface)? { return out(image, value); }
-    let (w,h) = lock(m)?.surface(surface)?.extent; let bytes = readback(m, surface)?;
-    if bytes.len() != (w*h*3/2) as usize { return Err(FAILED); }
-    let mut d = lock(m)?; let value = allocate_image(&mut d,w,h)?;
-    d.buffers.get_mut(&value.buf).unwrap().bytes = bytes; out(image,value)
+    let (w, h, fourcc) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc) };
+    let bytes = readback(m, surface)?;
+    if bytes.len() != packed_format(fourcc).packed(w, h).2 { return Err(FAILED); }
+    let mut d = lock(m)?; let value = allocate_image(&mut d, w, h, fourcc)?;
+    d.buffers.get_mut(&value.buf).unwrap().bytes = bytes; out(image, value)
 });
 callback!(destroy_image(ctx, id: u32) |d| {
     let image = d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if d.buffer(image.buf)?.mapped { return Err(INVALID); }
     let image = d.images.remove(&id).unwrap(); d.buffers.remove(&image.buf); Ok(())
 });
 callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, id: u32) |m| {
-    let (image, (cw,ch)) = { let d = lock(m)?; (*d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?, d.surface(surface)?.extent) };
+    let (image, (cw, ch), fourcc) = { let d = lock(m)?; let s = d.surface(surface)?; (*d.images.get(&id).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?, s.extent, s.fourcc) };
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
-    let (sw,sh) = (cw as usize,ch as usize);
-    let bytes = readback(m, surface)?; if bytes.len() != sw*sh*3/2 { return Err(FAILED); }
+    // The copy engine converts neither depth nor chroma format: the image is the surface's own format.
+    if image.format.fourcc != fourcc && !(fourcc == P010 && image.format.fourcc == P016) && !(fourcc == P012 && image.format.fourcc == P016) { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); }
+    let format = packed_format(fourcc);
+    let (spitch, soffsets, ssize) = format.packed(cw, ch);
+    let bytes = readback(m, surface)?; if bytes.len() != ssize { return Err(FAILED); }
     let mut d = lock(m)?;
     let b = d.buffers.get_mut(&image.buf).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?; if b.mapped { return Err(INVALID); }
-    for row in 0..h as usize { let start = (y as usize+row)*sw+x as usize; let dest = row*w as usize; b.bytes[dest..dest+w as usize].copy_from_slice(&bytes[start..start+w as usize]); }
-    for row in 0..h as usize/2 { let start = sw*sh+(y as usize/2+row)*sw+x as usize; let dest = (w*h) as usize+row*w as usize; b.bytes[dest..dest+w as usize].copy_from_slice(&bytes[start..start+w as usize]); } Ok(())
+    let bps = format.bytes_per_sample() as usize;
+    let (dpitch, doffsets, _) = format.packed(w, h);
+    let mut copy = |plane: usize, rows: usize, x0: usize, y0: usize, row_bytes: usize| {
+        for row in 0..rows {
+            let start = soffsets[plane] as usize + (y0 + row) * spitch as usize + x0;
+            let dest = doffsets[plane] as usize + row * dpitch as usize;
+            b.bytes[dest..dest + row_bytes].copy_from_slice(&bytes[start..start + row_bytes]);
+        }
+    };
+    copy(0, h as usize, x as usize * bps, y as usize, w as usize * bps);
+    if format.chroma_444 {
+        copy(1, h as usize, x as usize * bps, y as usize, w as usize * bps);
+        copy(2, h as usize, x as usize * bps, y as usize, w as usize * bps);
+    } else {
+        copy(1, h as usize / 2, x as usize * bps, y as usize / 2, w as usize * bps);
+    }
+    Ok(())
 });
 fn surface_attr(kind: VASurfaceAttribType, value: u32, settable: bool) -> VASurfaceAttrib {
     let mut attr: VASurfaceAttrib = Default::default();
@@ -961,17 +1155,22 @@ callback!(export_surface(ctx, id: u32, mem_type: u32, flags: u32, descriptor: *m
     if flags & !(VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_COMPOSED_LAYERS) != 0 || flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0 && flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     if descriptor.is_null() { return Err(INVALID); }
     if let Some(dma) = &d.surface(id)?.import { return out(descriptor.cast(), dma.export(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0)?); }
+    let format = Format::of_fourcc(d.surface(id)?.fourcc).ok_or(INVALID)?;
+    let composed = flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0;
+    let composed_format = format.composed_format();
+    if composed && composed_format.is_none() { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
     let export = d.export_output(id)?;
     let s = d.surface(id)?;
-    let mut desc: VADRMPRIMESurfaceDescriptor = zeroed(); desc.fourcc = NV12; desc.width = s.extent.0; desc.height = s.extent.1; desc.num_objects = 2;
-    let [y,uv] = export.fds; let fds = [y.into_raw_fd(),uv.into_raw_fd()];
-    for i in 0..2 { desc.objects[i].fd = fds[i]; desc.objects[i].size = export.sizes[i]; desc.objects[i].drm_format_modifier = export.modifier; }
-    if flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0 {
-        desc.num_layers = 1; desc.layers[0].drm_format = NV12; desc.layers[0].num_planes = 2;
-        for i in 0..2 { desc.layers[0].object_index[i] = i as u32; desc.layers[0].offset[i] = export.offsets[i]; desc.layers[0].pitch[i] = export.pitches[i]; }
+    let planes = format.planes();
+    let mut desc: VADRMPRIMESurfaceDescriptor = zeroed(); desc.fourcc = format.descriptor_fourcc(); desc.width = s.extent.0; desc.height = s.extent.1; desc.num_objects = planes as u32;
+    for (i, fd) in export.fds.into_iter().enumerate() { desc.objects[i].fd = fd.into_raw_fd(); desc.objects[i].size = export.size; desc.objects[i].drm_format_modifier = export.modifier; }
+    if composed {
+        desc.num_layers = 1; desc.layers[0].drm_format = composed_format.unwrap(); desc.layers[0].num_planes = planes as u32;
+        for i in 0..planes { desc.layers[0].object_index[i] = i as u32; desc.layers[0].offset[i] = export.offsets[i]; desc.layers[0].pitch[i] = export.pitches[i]; }
     } else {
-        desc.num_layers = 2;
-        for i in 0..2 { desc.layers[i].drm_format = if i == 0 { u32::from_le_bytes(*b"R8  ") } else { u32::from_le_bytes(*b"RG88") }; desc.layers[i].num_planes = 1; desc.layers[i].object_index[0] = i as u32; desc.layers[i].offset[0] = export.offsets[i]; desc.layers[i].pitch[0] = export.pitches[i]; }
+        desc.num_layers = planes as u32;
+        let layer_formats = format.layer_formats();
+        for i in 0..planes { desc.layers[i].drm_format = layer_formats[i]; desc.layers[i].num_planes = 1; desc.layers[i].object_index[0] = i as u32; desc.layers[i].offset[0] = export.offsets[i]; desc.layers[i].pitch[0] = export.pitches[i]; }
     } out(descriptor.cast(),desc)
 });
 // libva requires the legacy dispatch slots even when a feature is unsupported.
@@ -1218,7 +1417,7 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         (*ctx).max_profiles = (PROFILES.len() + encode::PROFILES.len()) as i32;
         (*ctx).max_entrypoints = 2;
         (*ctx).max_attributes = 64;
-        (*ctx).max_image_formats = 4;
+        (*ctx).max_image_formats = IMAGE_FORMATS.len() as i32;
         (*ctx).max_subpic_formats = 1;
         (*ctx).max_display_attributes = 1;
         (*ctx).str_vendor = vendor_string().as_ptr();

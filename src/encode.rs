@@ -2,7 +2,7 @@
 #![allow(non_upper_case_globals)] // Match libva's public ABI constant spelling.
 use crate::{
     array, count, dimensions, external_buffer_attr, gpu, image_format, import::{Dma, Kind}, input_image, new_input, out, surface_attr, va::*,
-    Completion, Driver, ENC_MAX_DIM, FAILED, INVALID, MAX_DIM, NV12, P010, Q416, R, YUV444P,
+    Completion, Driver, ENC_MAX_DIM, FAILED, IMAGE_FORMATS, INVALID, MAX_DIM, NV12, P010, P012, P016, Q416, R, YUV444P, profile_rt,
 };
 use nvrm::video::enc::{EncConfig, Encoder, ENC_AV1, ENC_H264, ENC_HEVC};
 use std::{mem::size_of, sync::{mpsc, Arc}, thread};
@@ -465,7 +465,7 @@ fn upload(e: &mut Encoder, i: &Input, chroma: &mut Vec<u8>) -> R {
     let y = &i.bytes[i.offsets[0]..];
     let uv = &i.bytes[i.offsets[1]..];
     gpu(match i.fourcc {
-        P010 => e.load_p010(y, i.pitch, uv, i.pitch),
+        P010 | P012 | P016 => e.load_p010(y, i.pitch, uv, i.pitch),
         YUV444P => e.load_yuv444(y, i.pitch, uv, i.pitch, &i.bytes[i.offsets[2]..], i.pitch),
         Q416 => {
             let w = e.cfg.width as usize;
@@ -701,17 +701,10 @@ pub(super) unsafe fn query_images(formats: *mut VAImageFormat, n: *mut i32) -> R
     if formats.is_null() {
         return Err(INVALID);
     }
-    for (i, fourcc) in INPUT_FORMATS.iter().enumerate() {
-        let mut format = image_format();
-        format.fourcc = *fourcc;
-        format.bits_per_pixel = match *fourcc {
-            P010 | YUV444P => 24,
-            Q416 => 48,
-            _ => 12,
-        };
-        formats.add(i).write(format);
+    for (i, fourcc) in IMAGE_FORMATS.iter().enumerate() {
+        formats.add(i).write(image_format(*fourcc));
     }
-    out(n, INPUT_FORMATS.len() as i32)
+    out(n, IMAGE_FORMATS.len() as i32)
 }
 
 pub(super) unsafe fn create_image(
@@ -724,7 +717,7 @@ pub(super) unsafe fn create_image(
     if format.is_null() || image.is_null() || w <= 0 || h <= 0 {
         return Err(INVALID);
     }
-    if !INPUT_FORMATS.contains(&(*format).fourcc) {
+    if !IMAGE_FORMATS.contains(&(*format).fourcc) {
         return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus);
     }
     let input = new_input((*format).fourcc, w as u32, h as u32);
@@ -829,6 +822,12 @@ pub(super) unsafe fn query_surface_attributes(
         ),
         external_buffer_attr(),
     ];
+    if let Some(&(profile, _)) = d.configs.get(&config) {
+        // As the C driver: the formats of the profile's chroma format, any of which a client may name.
+        let formats: &[u32] = if profile_rt(profile) & VA_RT_FORMAT_YUV444 != 0 { &[YUV444P, Q416] } else { &[NV12, P010, P012, P016] };
+        values.retain(|value| value.type_ != VASurfaceAttribPixelFormat);
+        values.extend(formats.iter().map(|f| surface_attr(VASurfaceAttribPixelFormat, *f, true)));
+    }
     if let Some(&(profile, _)) = d.enc_configs.get(&config) {
         values[3] = surface_attr(VASurfaceAttribMaxWidth, ENC_MAX_DIM, false);
         values[4] = surface_attr(VASurfaceAttribMaxHeight, ENC_MAX_DIM, false);
