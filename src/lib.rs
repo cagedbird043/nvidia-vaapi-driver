@@ -1,4 +1,5 @@
 mod backend;
+mod encode;
 pub mod va;
 
 use std::{
@@ -17,6 +18,10 @@ const INVALID: VAStatus = VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus;
 const FAILED: VAStatus = VA_STATUS_ERROR_OPERATION_FAILED as VAStatus;
 const UNIMPL: VAStatus = VA_STATUS_ERROR_UNIMPLEMENTED as VAStatus;
 const NV12: u32 = u32::from_le_bytes(*b"NV12");
+const P010: u32 = u32::from_le_bytes(*b"P010");
+const YUV444P: u32 = u32::from_le_bytes(*b"444P");
+const Q416: u32 = u32::from_le_bytes(*b"Q416");
+const ENC_MAX_DIM: u32 = 8192;
 const MAX_DIM: u32 = 4096;
 const PROFILES: [VAProfile; 7] = [
     VAProfileH264Baseline,
@@ -276,6 +281,7 @@ struct Context {
 struct Surface {
     width: u32,
     height: u32,
+    fourcc: u32,
     owner: Option<u32>,
     worker: Option<Arc<Worker>>,
     extent: (u32, u32),
@@ -284,6 +290,7 @@ struct Surface {
     copy: Option<Arc<Completion>>,
     output: Option<backend::Export>,
     output_dirty: bool,
+    input: Option<encode::Input>,
 }
 impl Surface {
     fn pending(&self) -> Vec<Arc<Completion>> {
@@ -297,12 +304,16 @@ struct Buffer {
     count: u32,
     bytes: Vec<u8>,
     mapped: bool,
+    coded: Option<Box<VACodedBufferSegment>>,
+    derived: Option<u32>,
 }
 struct Driver {
     /// The NVIDIA GPU behind the DRM device libva opened for this display.
     pci: [u32; 4],
     next: u32,
     configs: HashMap<u32, VAProfile>,
+    enc_configs: HashMap<u32, (VAProfile, u32)>,
+    enc_contexts: HashMap<u32, encode::Session>,
     surfaces: HashMap<u32, Surface>,
     contexts: HashMap<u32, Context>,
     buffers: HashMap<u32, Buffer>,
@@ -316,6 +327,8 @@ impl Driver {
             next: 1,
             configs: HashMap::new(),
             surfaces: HashMap::new(),
+            enc_configs: HashMap::new(),
+            enc_contexts: HashMap::new(),
             contexts: HashMap::new(),
             buffers: HashMap::new(),
             images: HashMap::new(),
@@ -395,8 +408,8 @@ unsafe fn out<T>(p: *mut T, value: T) -> R {
 fn count(n: i32) -> R<usize> {
     usize::try_from(n).map_err(|_| INVALID)
 }
-fn dimensions(w: u32, h: u32) -> R {
-    if w == 0 || h == 0 || w > MAX_DIM || h > MAX_DIM || w % 2 != 0 || h % 2 != 0 {
+fn dimensions(w: u32, h: u32, max: u32) -> R {
+    if w == 0 || h == 0 || w > max || h > max || w % 2 != 0 || h % 2 != 0 {
         Err(VA_STATUS_ERROR_RESOLUTION_NOT_SUPPORTED as VAStatus)
     } else {
         Ok(())
@@ -460,15 +473,17 @@ macro_rules! callback_unlocked {
     };
 }
 callback!(query_profiles(ctx, list: *mut VAProfile, n: *mut i32) |_d| {
-    if list.is_null() { return Err(INVALID); } ptr::copy_nonoverlapping(PROFILES.as_ptr(), list, PROFILES.len()); out(n, PROFILES.len() as i32)
+    encode::query_profiles(list, n)
 });
 callback!(query_entrypoints(ctx, p: VAProfile, list: *mut VAEntrypoint, n: *mut i32) |_d| {
-    supported(p, VAEntrypointVLD)?; out(list, VAEntrypointVLD)?; out(n, 1)
+    encode::query_entrypoints(p, list, n)
 });
 callback!(get_config_attributes(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32) |_d| {
+    if e == VAEntrypointEncSlice { return encode::get_attributes(p, attrs, n); }
     supported(p, e)?; for i in 0..count(n)? { let a = array(attrs, count(n)?)?[i]; (*attrs.add(i)).value = attribute(a.type_); } Ok(())
 });
 callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32, id: *mut u32) |d| {
+    if e == VAEntrypointEncSlice { return encode::create_config(d, p, attrs, n, id); }
     supported(p, e)?; if id.is_null() { return Err(INVALID); }
     for a in array(attrs, count(n)?)? {
         let value = attribute(a.type_);
@@ -476,30 +491,47 @@ callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfig
     }
     let key = d.id()?; d.configs.insert(key, p); out(id, key)
 });
-callback!(destroy_config(ctx, id: u32) |d| { d.configs.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?; Ok(()) });
+callback!(destroy_config(ctx, id: u32) |d| { if d.enc_configs.remove(&id).is_some() { return Ok(()); } d.configs.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?; Ok(()) });
 callback!(query_config(ctx, id: u32, p: *mut VAProfile, e: *mut VAEntrypoint, attrs: *mut VAConfigAttrib, n: *mut i32) |d| {
+    if let Some(&(profile, _)) = d.enc_configs.get(&id) { return encode::query_config(profile, p, e, attrs, n); }
     let profile = *d.configs.get(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?;
     if p.is_null() || e.is_null() || attrs.is_null() || n.is_null() { return Err(INVALID); }
     out(p, profile)?; out(e, VAEntrypointVLD)?;
     out(attrs, VAConfigAttrib { type_: VAConfigAttribRTFormat, value: VA_RT_FORMAT_YUV420 })?; out(n, 1)
 });
 callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32, n: u32, attrs: *mut VASurfaceAttrib, na: u32) |d| {
-    dimensions(w, h)?;
-    if format != VA_RT_FORMAT_YUV420 { return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus); }
+    dimensions(w, h, ENC_MAX_DIM)?;
+    if format & !(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV444 | VA_RT_FORMAT_YUV444_10) != 0 || format == 0 {
+        return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus);
+    }
     if n == 0 || surfaces.is_null() { return Err(INVALID); }
+    let mut fourcc = match format {
+        VA_RT_FORMAT_YUV420_10 => P010,
+        VA_RT_FORMAT_YUV444 => YUV444P,
+        VA_RT_FORMAT_YUV444_10 => Q416,
+        _ => NV12,
+    };
     for a in array(attrs, na as usize)? {
         if a.flags & VA_SURFACE_ATTRIB_SETTABLE == 0 { continue; }
         if a.value.type_ != VAGenericValueTypeInteger { return Err(INVALID); }
         let v = a.value.value.i as u32;
         match a.type_ {
-            va::VASurfaceAttribPixelFormat if v == NV12 => (),
+            va::VASurfaceAttribPixelFormat if encode::INPUT_FORMATS.contains(&v) => { fourcc = v; },
             va::VASurfaceAttribMemoryType if v == VA_SURFACE_ATTRIB_MEM_TYPE_VA => (),
             va::VASurfaceAttribUsageHint => (),
             va::VASurfaceAttribMemoryType => return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus),
             _ => return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus),
         }
     }
-    for i in 0..n as usize { let id = d.id()?; d.surfaces.insert(id, Surface { width: w, height: h, owner: None, worker: None, extent: (w,h), decode: None, copy: None, output: None, output_dirty: false }); surfaces.add(i).write(id); } Ok(())
+    for i in 0..n as usize {
+        let id = d.id()?;
+        d.surfaces.insert(id, Surface {
+            width: w, height: h, fourcc, owner: None, worker: None, extent: (w, h),
+            decode: None, copy: None, output: None, output_dirty: false, input: None,
+        });
+        surfaces.add(i).write(id);
+    }
+    Ok(())
 });
 unsafe extern "C" fn create_surfaces(
     ctx: VADriverContextP,
@@ -526,14 +558,15 @@ unsafe extern "C" fn create_surfaces(
 callback!(destroy_surfaces(ctx, ids: *mut u32, n: i32) |d| {
     let ids = array(ids, count(n)?)?; let mut seen = HashSet::new();
     for id in ids { d.surface(*id)?; if !seen.insert(*id) { return Err(INVALID); }
-        if d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == *id)) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
+        if busy(d, *id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
     }
     for id in ids { let s = d.surfaces.remove(id).unwrap(); if let Some(worker) = s.worker { worker.tx.send(Command::Release(*id)).map_err(|_| FAILED)?; } if s.output.is_some() { d.output_worker.as_ref().ok_or(FAILED)?.tx.send(OutputCommand::Release(*id)).map_err(|_| FAILED)?; } for c in d.contexts.values_mut() { c.targets.remove(id); } }
     Ok(())
 });
 callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: *mut u32, n: i32, id: *mut u32) |d| {
+    if let Some(&config) = d.enc_configs.get(&config) { return encode::create_context(d, config, w, h, targets, n, id); }
     if !d.configs.contains_key(&config) { return Err(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus); }
-    if id.is_null() || w <= 0 || h <= 0 { return Err(INVALID); } dimensions(w as u32, h as u32)?;
+    if id.is_null() || w <= 0 || h <= 0 { return Err(INVALID); } dimensions(w as u32, h as u32, MAX_DIM)?;
     if flags & !(VA_PROGRESSIVE as i32) != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     let targets: HashSet<u32> = array(targets, count(n)?)?.iter().copied().collect();
     for target in &targets { let s = d.surface(*target)?; if s.width < w as u32 || s.height < h as u32 { return Err(INVALID); } }
@@ -542,6 +575,10 @@ callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: 
     d.contexts.insert(key, Context { codec, worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
 });
 callback!(destroy_context(ctx, id: u32) |d| {
+    if d.enc_contexts.remove(&id).is_some() {
+        d.buffers.retain(|_, b| b.context != Some(id));
+        return Ok(());
+    }
     d.contexts.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     d.buffers.retain(|_, b| b.context != Some(id));
     Ok(())
@@ -558,25 +595,38 @@ fn buffer_shape(codec: backend::Codec, kind: VABufferType, size: u32) -> bool {
     }
 }
 callback!(create_buffer(ctx, context: u32, kind: VABufferType, size: u32, n: u32, data: *mut c_void, id: *mut u32) |d| {
-    let codec = d.context(context)?.codec; if id.is_null() || n == 0 { return Err(INVALID); }
-    if !buffer_shape(codec, kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
+    if id.is_null() || n == 0 { return Err(INVALID); }
+    if !d.enc_contexts.contains_key(&context) {
+        let codec = d.context(context)?.codec;
+        if !buffer_shape(codec, kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
+    }
     let len = (size as usize).checked_mul(n as usize).filter(|v| *v <= isize::MAX as usize).ok_or(INVALID)?;
     let mut bytes = Vec::new(); bytes.try_reserve_exact(len).map_err(|_| VA_STATUS_ERROR_ALLOCATION_FAILED as VAStatus)?; bytes.resize(len, 0);
     if !data.is_null() { ptr::copy_nonoverlapping(data as *const u8, bytes.as_mut_ptr(), len); }
-    let key = d.id()?; d.buffers.insert(key, Buffer { context: Some(context), kind, size, count: n, bytes, mapped: false }); out(id, key)
+    let key = d.id()?;
+    d.buffers.insert(key, Buffer {
+        context: Some(context), kind, size, count: n, bytes, mapped: false,
+        coded: if kind == VAEncCodedBufferType { Some(Box::default()) } else { None },
+        derived: None,
+    });
+    out(id, key)
 });
 callback!(set_buffer_elements(ctx, id: u32, n: u32) |d| {
     let b = d.buffers.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?;
     if b.mapped || b.context.is_none() || n == 0 || (b.size as usize).checked_mul(n as usize).is_none_or(|v| v > b.bytes.len()) { return Err(INVALID); } b.count = n; Ok(())
 });
 callback!(map_buffer(ctx, id: u32, p: *mut *mut c_void) |d| {
-    let b = d.buffers.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?;
-    if b.mapped { return Err(INVALID); } out(p, b.bytes.as_mut_ptr().cast())?; b.mapped = true; Ok(())
+    encode::map_buffer(d, id, p)
 });
-callback!(unmap_buffer(ctx, id: u32) |d| { let b = d.buffers.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)?; if !b.mapped { return Err(INVALID); } b.mapped = false; Ok(()) });
+callback!(unmap_buffer(ctx, id: u32) |d| { encode::unmap_buffer(d, id) });
 callback!(destroy_buffer(ctx, id: u32) |d| { let b = d.buffer(id)?; if b.mapped || b.context.is_none() { return Err(INVALID); } d.buffers.remove(&id); Ok(()) });
 callback!(buffer_info(ctx, id: u32, kind: *mut VABufferType, size: *mut u32, n: *mut u32) |d| { let b = d.buffer(id)?; out(kind, b.kind)?; out(size, b.size)?; out(n, b.count) });
 callback!(begin_picture(ctx, id: u32, target: u32) |d| {
+    if d.enc_contexts.contains_key(&id) {
+        d.surface(target)?;
+        if busy(d, target) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
+        return d.enc_contexts.get_mut(&id).unwrap().begin(target);
+    }
     let s = d.surface(target)?; let c = d.context(id)?;
     if c.frame.is_some() { return Err(INVALID); }
     if (!c.targets.is_empty() && !c.targets.contains(&target)) || s.width < c.width || s.height < c.height { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
@@ -589,6 +639,7 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
     s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.output_dirty = true; Ok(())
 });
 callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
+    if d.enc_contexts.contains_key(&id) { return encode::render_picture(d, id, ids, n); }
     if d.context(id)?.frame.is_none() { return Err(INVALID); }
     let ids = array(ids, count(n)?)?;
     for key in ids { let b = d.buffer(*key)?; if b.context != Some(id) || b.mapped { return Err(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus); } }
@@ -644,6 +695,33 @@ fn prepare(f: &mut Frame) -> R<backend::Picture> {
 }
 // Queues the decode and returns; its outcome is reported by vaSyncSurface.
 callback!(end_picture(ctx, id: u32) |d| {
+    if d.enc_contexts.contains_key(&id) {
+        let c = &d.enc_contexts[&id];
+        let target = c.target.ok_or(INVALID)?;
+        let coded = c.coded.ok_or(INVALID)?;
+        let s = d.surface(target)?;
+        let (w, h) = s.extent;
+        // Decode surfaces currently cross the NVDEC/NVENC layouts through CPU readback.
+        if let Some(done) = s.decode.as_ref() {
+            done.wait()?;
+            let bytes = s.worker.as_ref().ok_or(INVALID)?.readback(target)?;
+            d.surfaces.get_mut(&target).unwrap().input = Some(encode::Input {
+                bytes, fourcc: NV12, pitch: w as usize,
+                offsets: [0, (w * h) as usize, 0],
+            });
+        }
+        let c = d.enc_contexts.get_mut(&id).unwrap();
+        // VA sequence dimensions may be padded to coding-block boundaries; uploads
+        // retain the visible extent. Never ask RM to read beyond an input plane.
+        c.cfg.width = c.cfg.width.min(w as i32);
+        c.cfg.height = c.cfg.height.min(h as i32);
+        let input = d.surfaces.get_mut(&target).unwrap().input.take().ok_or(INVALID)?;
+        let output = std::mem::take(&mut d.buffers.get_mut(&coded).ok_or(INVALID)?.bytes);
+        let (input, output) = c.encode(input, output)?;
+        d.surfaces.get_mut(&target).unwrap().input = Some(input);
+        d.buffers.get_mut(&coded).unwrap().bytes = output;
+        return Ok(());
+    }
     let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     let mut f = c.frame.take().ok_or(INVALID)?;
     let (worker, target) = (c.worker.clone(), f.target);
@@ -658,6 +736,7 @@ callback!(end_picture(ctx, id: u32) |d| {
 });
 fn busy(d: &Driver, id: u32) -> bool {
     d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == id))
+        || d.enc_contexts.values().any(|c| c.target == Some(id))
 }
 callback_unlocked!(sync_surface(ctx, id: u32) |m| {
     let pending = { let d = lock(m)?; let s = d.surface(id)?; if busy(&d, id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); } s.pending() };
@@ -681,8 +760,48 @@ fn image_format() -> VAImageFormat {
         ..Default::default()
     }
 }
+fn new_input(fourcc: u32, w: u32, h: u32) -> encode::Input {
+    let wide = matches!(fourcc, P010 | Q416);
+    let full = matches!(fourcc, YUV444P | Q416);
+    let pitch = w as usize * if wide { 2 } else { 1 };
+    let l = pitch * h as usize;
+    let size = if full { l * 3 } else { l * 3 / 2 };
+    encode::Input {
+        bytes: vec![0; size],
+        fourcc,
+        pitch,
+        offsets: [0, l, if full { l * 2 } else { 0 }],
+    }
+}
+fn input_image(d: &mut Driver, input: &encode::Input, w: u32, h: u32) -> R<VAImage> {
+    let mut image = allocate_image(d, w, h)?;
+    image.format.fourcc = input.fourcc;
+    image.format.bits_per_pixel = match input.fourcc {
+        P010 | YUV444P => 24,
+        Q416 => 48,
+        _ => 12,
+    };
+    image.num_planes = if matches!(input.fourcc, YUV444P | Q416) {
+        3
+    } else {
+        2
+    };
+    image.pitches = [
+        input.pitch as u32,
+        input.pitch as u32,
+        if image.num_planes == 3 {
+            input.pitch as u32
+        } else {
+            0
+        },
+    ];
+    image.offsets = input.offsets.map(|v| v as u32);
+    image.data_size = input.bytes.len() as u32;
+    d.images.insert(image.image_id, image);
+    Ok(image)
+}
 fn allocate_image(d: &mut Driver, w: u32, h: u32) -> R<VAImage> {
-    dimensions(w, h)?;
+    dimensions(w, h, ENC_MAX_DIM)?;
     let size = w * h * 3 / 2;
     let id = d.id()?;
     let buffer = d.id()?;
@@ -705,19 +824,22 @@ fn allocate_image(d: &mut Driver, w: u32, h: u32) -> R<VAImage> {
             kind: VAImageBufferType,
             size,
             count: 1,
-            bytes: vec![0; size as usize],
+            bytes: Vec::new(),
             mapped: false,
+            coded: None,
+            derived: None,
         },
     );
     d.images.insert(id, image);
     Ok(image)
 }
-callback!(query_images(ctx, formats: *mut VAImageFormat, n: *mut i32) |_d| { out(formats, image_format())?; out(n, 1) });
+callback!(query_images(ctx, formats: *mut VAImageFormat, n: *mut i32) |_d| { encode::query_images(formats, n) });
 callback!(create_image(ctx, format: *mut VAImageFormat, w: i32, h: i32, image: *mut VAImage) |d| {
-    if format.is_null() || image.is_null() || w <= 0 || h <= 0 { return Err(INVALID); } if (*format).fourcc != NV12 { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); } let value = allocate_image(d, w as u32, h as u32)?; out(image, value)
+    encode::create_image(d, format, w, h, image)
 });
 callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
     if image.is_null() { return Err(INVALID); }
+    if let Some(value) = encode::derive_input_image(&mut *lock(m)?, surface)? { return out(image, value); }
     let (w,h) = lock(m)?.surface(surface)?.extent; let bytes = readback(m, surface)?;
     if bytes.len() != (w*h*3/2) as usize { return Err(FAILED); }
     let mut d = lock(m)?; let value = allocate_image(&mut d,w,h)?;
@@ -751,9 +873,7 @@ fn surface_attr(kind: VASurfaceAttribType, value: u32, settable: bool) -> VASurf
     attr
 }
 callback!(query_surface_attrs(ctx, config: u32, attrs: *mut VASurfaceAttrib, n: *mut u32) |d| {
-    if !d.configs.contains_key(&config) { return Err(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus); } if n.is_null() { return Err(INVALID); }
-    let values = [surface_attr(VASurfaceAttribPixelFormat,NV12,true),surface_attr(VASurfaceAttribMinWidth,2,false),surface_attr(VASurfaceAttribMinHeight,2,false),surface_attr(VASurfaceAttribMaxWidth,MAX_DIM,false),surface_attr(VASurfaceAttribMaxHeight,MAX_DIM,false),surface_attr(VASurfaceAttribMemoryType,VA_SURFACE_ATTRIB_MEM_TYPE_VA,true),surface_attr(VASurfaceAttribUsageHint,VA_SURFACE_ATTRIB_USAGE_HINT_DECODER,true)];
-    if attrs.is_null() { return out(n,values.len() as u32); } let available = *n; out(n,values.len() as u32)?; if available < values.len() as u32 { return Err(VA_STATUS_ERROR_MAX_NUM_EXCEEDED as VAStatus); } ptr::copy_nonoverlapping(values.as_ptr(),attrs,values.len()); Ok(())
+    encode::query_surface_attributes(d, config, attrs, n)
 });
 callback!(export_surface(ctx, id: u32, mem_type: u32, flags: u32, descriptor: *mut c_void) |d| {
     if mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 { return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus); }
@@ -797,20 +917,9 @@ unsupported!(
     )
 );
 unsupported!(set_palette(image: u32, palette: *mut u8));
-unsupported!(
-    put_image(
-        surface: u32,
-        image: u32,
-        sx: i32,
-        sy: i32,
-        sw: u32,
-        sh: u32,
-        dx: i32,
-        dy: i32,
-        dw: u32,
-        dh: u32,
-    )
-);
+callback!(put_image(ctx, surface: u32, image: u32, sx: i32, sy: i32, sw: u32, sh: u32, dx: i32, dy: i32, dw: u32, dh: u32) |d| {
+    encode::put_image(d, surface, image, (sx, sy, sw, sh), (dx, dy, dw, dh))
+});
 unsupported!(create_subpicture(image: u32, sub: *mut u32));
 unsupported!(destroy_subpicture(sub: u32));
 unsupported!(set_subpicture_image(sub: u32, image: u32));
@@ -869,7 +978,7 @@ unsupported!(
     )
 );
 unsupported!(query_processing(config: u32, param: *mut VAProcessingRateParameter, rate: *mut u32));
-unsupported!(sync_buffer(id: u32, timeout: u64));
+callback!(sync_buffer(ctx, id: u32, _timeout: u64) |d| { d.buffer(id)?; Ok(()) });
 unsupported!(copy_object(dst: *mut VACopyObject, src: *mut VACopyObject, option: VACopyOption));
 callback!(query_subpictures(ctx, _formats:*mut VAImageFormat, _flags:*mut u32, n:*mut u32) |_d| { out(n,0) });
 callback!(query_display_attributes(ctx, _attrs:*mut VADisplayAttribute, n:*mut i32) |_d| { out(n,0) });
@@ -1008,13 +1117,13 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         table.vaMapBuffer2 = Some(map_buffer2);
         (*ctx).version_major = VA_MAJOR_VERSION as i32;
         (*ctx).version_minor = VA_MINOR_VERSION as i32;
-        (*ctx).max_profiles = PROFILES.len() as i32;
-        (*ctx).max_entrypoints = 1;
-        (*ctx).max_attributes = 5;
-        (*ctx).max_image_formats = 1;
+        (*ctx).max_profiles = (PROFILES.len() + encode::PROFILES.len()) as i32;
+        (*ctx).max_entrypoints = 2;
+        (*ctx).max_attributes = 64;
+        (*ctx).max_image_formats = 4;
         (*ctx).max_subpic_formats = 1;
         (*ctx).max_display_attributes = 1;
-        (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC driver\0".as_ptr().cast();
+        (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC/NVENC driver\0".as_ptr().cast();
         (*ctx).pDriverData = Box::into_raw(Box::new(Mutex::new(Driver::new(pci)))).cast();
         (*ctx).vtable.write(table);
     })) {
