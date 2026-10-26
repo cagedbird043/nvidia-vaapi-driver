@@ -303,6 +303,107 @@ def transcode(args, env, directory):
     return inspect(args, dest, 'nv12', '1280x720', 120)
 
 
+def build_tools(directory):
+    tests = Path(__file__).resolve().parent
+    flags = lambda *libs: subprocess.run(['pkg-config', '--cflags', '--libs', *libs], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
+    tools = {}
+    for name, libs, extra in [('dmabuf_import', ['libva', 'libva-drm', 'libdrm'], ['-ldl']),
+                              ('dmabuf_export', ['libva', 'libavcodec', 'libavformat', 'libavutil'], [])]:
+        tools[name] = directory / name
+        run(['gcc', '-O1', '-o', str(tools[name]), str(tests / f'{name}.c'), *flags(*libs), *extra])
+    return tools
+
+
+def bgra_reference(directory, w, h, frames):
+    # Same pattern as dmabuf_import.c; converted with swscale BT.709 limited range.
+    raw = directory / 'bgra.raw'
+    with open(raw, 'wb') as f:
+        for n in range(frames):
+            b = bytearray(w * h * 4)
+            for j in range(h):
+                for i in range(w):
+                    o = (j * w + i) * 4
+                    b[o] = (i * 2 + n * 3 + (j & 7) * 5) & 255
+                    b[o + 1] = (j * 2 + n * 5 + (i & 3) * 9) & 255
+                    b[o + 2] = (i + j + n * 7) & 255
+                    b[o + 3] = 255
+            f.write(b)
+    ref = directory / 'bgra-ref.mkv'
+    run(['ffmpeg', '-v', 'error', '-f', 'rawvideo', '-pix_fmt', 'bgra', '-s', f'{w}x{h}', '-i', str(raw),
+         '-vf', 'scale=out_color_matrix=bt709:out_range=tv,format=yuv420p', '-c:v', 'ffv1', '-y', str(ref)])
+    return ref
+
+
+def zero_copy(args, env, directory):
+    """Decode-surface and external dma-buf inputs against the same content uploaded with vaPutImage."""
+    tools = build_tools(directory)
+    node, rows = args.device, []
+
+    def check(name, fn):
+        try:
+            rows.append(dict(case=name, ok=True, **(fn() or {})))
+        except RuntimeError as error:
+            rows.append(dict(case=name, ok=False, error=str(error)[-300:]))
+        print('zero-copy', json.dumps(rows[-1]), flush=True)
+
+    def encode(codec, fmt, source, w, h, frames=12):
+        out = directory / f'zc-{codec}-{fmt}-{source}-{w}x{h}.bin'
+        run([str(tools['dmabuf_import']), node, codec, fmt, source, str(w), str(h), str(frames), str(out)], env)
+        return out.read_bytes()
+
+    def same_as_put(codec, fmt, source, w, h):
+        def fn():
+            if encode(codec, fmt, source, w, h) != encode(codec, fmt, 'put', w, h):
+                raise RuntimeError('bitstream differs from vaPutImage upload')
+        return fn
+    for codec, fmt in [('h264', 'nv12'), ('hevc', 'nv12'), ('hevc', 'p010')]:
+        for source in ['linear', 'bl']:
+            for w, h in [(1280, 720), (642, 362)]:
+                check(f'import-{codec}-{fmt}-{source}-{w}x{h}', same_as_put(codec, fmt, source, w, h))
+
+    def bgra():
+        w, h, frames = 640, 360, 6
+        ref = bgra_reference(directory, w, h, frames)
+        streams = [encode('h264', 'bgra', source, w, h, frames) for source in ('linear', 'bl')]
+        if streams[0] != streams[1]:
+            raise RuntimeError('linear and block-linear BGRA differ')
+        raw = directory / 'zc-h264-bgra-linear-640x360.bin'
+        text = run(['ffmpeg', '-v', 'info', '-i', str(raw), '-i', str(ref), '-lavfi', '[0:v]format=yuv420p[a];[1:v]format=yuv420p[b];[a][b]psnr',
+                    '-f', 'null', '-'], None).stderr
+        psnr = float(re.findall(r'average:([\d.]+)', text)[-1])
+        if psnr < 30:
+            raise RuntimeError(f'BGRA PSNR {psnr}')
+        return dict(psnr=psnr)
+    check('import-bgra-linear-bl-psnr', bgra)
+
+    source = directory / 'zc-source.mp4'
+    run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', 'testsrc2=size=1280x720:rate=30', '-frames:v', '150',
+         '-pix_fmt', 'yuv420p', '-c:v', 'libx264', '-bf', '0', '-g', '60', '-y', str(source)])
+
+    def export_reimport():
+        outs = []
+        for mode in ('direct', 'reimport'):
+            out = directory / f'zc-export-{mode}.h264'
+            run([str(tools['dmabuf_export']), node, str(source), mode, str(out)], env)
+            outs.append(out.read_bytes())
+        if outs[0] != outs[1]:
+            raise RuntimeError('export -> DRM_PRIME_2 import differs from direct transcode')
+    check('export-reimport-bytes', export_reimport)
+
+    def cycles(codec, fmt, src):
+        def fn():
+            text = run([str(tools['dmabuf_import']), node, codec, fmt, src, '640', '360', '0', os.devnull, '1000'], env).stdout
+            m = re.search(r'rss_kb (\d+) -> (\d+) fds (\d+) -> (\d+)', text)
+            r0, r1, f0, f1 = map(int, m.groups())
+            if f1 > f0 or r1 > r0 + 512:
+                raise RuntimeError(text)
+            return dict(rss_kb=[r0, r1], fds=[f0, f1])
+        return fn
+    for codec, fmt, src in [('h264', 'nv12', 'linear'), ('h264', 'nv12', 'bl'), ('hevc', 'p010', 'bl'), ('h264', 'bgra', 'linear')]:
+        check(f'import-cycles-{codec}-{fmt}-{src}', cycles(codec, fmt, src))
+    return rows
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--driver', default=os.environ.get('LIBVA_DRIVER_NAME', 'rustnv'))
@@ -352,12 +453,15 @@ def main():
                 results[f'{label}_{name}'] = check(args, env, directory)
             except RuntimeError as error:
                 results[f'{label}_{name}_extra_error'] = str(error)
+    # Zero-copy inputs only exist in the candidate; the C driver does not run these programs.
+    results['candidate_zero_copy'] = zero_copy(args, environment(args.driver, args.library), args.output / 'candidate')
     results['capabilities_equal'] = (args.output / 'reference/vainfo.txt').read_text() == (args.output / 'candidate/vainfo.txt').read_text()
     results['attributes_equal'] = json.loads((args.output / 'reference/attributes.json').read_text()) == json.loads((args.output / 'candidate/attributes.json').read_text())
     (args.output / 'results.json').write_text(json.dumps(results, indent=2))
     # The exit status judges the candidate; the reference driver's own failures stay in the JSON for comparison.
     passed = (results['capabilities_equal'] and results['attributes_equal']
               and all(row['ok'] for label in ('candidate', 'candidate_direct') for row in results.get(label, []))
+              and all(row['ok'] for row in results['candidate_zero_copy'])
               and not any(k.startswith('candidate_') and k.endswith('_extra_error') for k in results))
     return 0 if passed else 1
 

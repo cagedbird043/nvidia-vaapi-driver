@@ -40,7 +40,7 @@ VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 
 - 8-bit 444P 直接交给 RM 做 tiled chroma interleave。Q416 使用每个 context 复用的 chroma staging 缓冲，将两个 16-bit 平面交错后上传；luma 不做 staging 拷贝。
 - H.264 / HEVC 忽略应用 packed SPS/PPS/slice，使用 RM 生成的参数集，在每个 IDR 前重复。AV1 接受 packed sequence 参数，RM 输出 in-band sequence OBU。
 - coded buffer map 返回 `VACodedBufferSegment`（单段链、`VA_CODED_BUF_STATUS_SINGLE_NALU`）。提交当前为同步编码，因此 surface / buffer 同步查询在提交返回后已完成。
-- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface 转码目前经 NV12 CPU readback 后重新上传；尚不做 DMA-BUF 导入零拷贝。
+- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface 作编码输入不经 CPU：surface 的导出 backing（8 行 GOB、单 GOB 块高的块线性）由 GPU copy engine 重排进 NVENC 输入槽，字节与 CPU tiler 一致。外部 DMA-BUF 的 NV12 / P010 同走 copy engine；BGRA 先经 copy engine 拷入系统内存 staging，再由 CPU 按 BT.709 转换（见“遗留”）。
 - RM 的帧率接口为整数，分数帧率四舍五入。RateControl / FrameRate misc 参数被消费；其余 misc（包含 HRD / QualityLevel）与当前 C 后端一样接受但不消费。
 
 FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由回归脚本里的直接 VA 客户端测试，并检查输出色度/位深。
@@ -180,7 +180,7 @@ RTFormat：H.264 constrained baseline / main 与 HEVC main 为 420；H.264 high 
 C 驱动作为对照有自己的失败（只记录，不影响退出码）：AV1 忽略第 45 帧强制关键帧（实际 keyframes 为 0/60，rustnv 为 0/45/105）；部分 444 CBR/VBR 超出目标 ±10%；HEVC Q416 无法协商；对尚未解码的 444 surface 调用 derive 失败（put 上传成功，rustnv 两条上传路径都成功）。
 
 两边三个 codec × CBR/VBR 的 min=max=35 都由 `trace_headers` 证明 120 帧量化值恰为 35。FFmpeg 在 CQP 下不提交 qmin/qmax misc，CQP 的上下界由调用者提交 RateControl misc 时生效。
-转码两边均为 120 帧、软件严格解码成功；rustnv 当前有 CPU 下载/上传。
+转码两边均为 120 帧、软件严格解码成功；rustnv 的解码 surface 转码无 CPU 回读。
 
 | 连续 3000 帧 1080p | 热身后 RSS | 结束前 RSS | 增量 |
 |---|---:|---:|---:|
@@ -189,3 +189,46 @@ C 驱动作为对照有自己的失败（只记录，不影响退出码）：AV1
 
 两边均连续编码 3000 帧且严格解码无错误；RSS 在热身后基本稳定，上表保留实际测得的微小增量。
 `cargo build --release` 无警告；`tests/decode.py` 的 9 组全部逐字节一致；RM `cargo test --lib video::` 为 60 passed / 20 ignored；176 组 C/Rust NVENC 对照的 setup 和码流全部逐字节一致。
+
+## 零拷贝编码输入（2c）
+
+| 输入来源 | 到 NVENC 的路径 |
+|---|---|
+| 解码 surface | 导出 backing → GPU copy engine（块线性 → NVENC 输入 tile）→ 输入槽 |
+| DRM_PRIME_2 / DRM_PRIME（NV12、P010/P012/P016） | 导入 dma-buf → copy engine → 输入槽 |
+| DRM_PRIME_2 / DRM_PRIME（ARGB、XRGB） | 导入 → copy engine → 系统内存 staging → CPU BT.709 转换 → 输入槽 |
+| `vaPutImage` / `vaDeriveImage` | CPU 写显存（未变） |
+
+- `vaCreateSurfaces` 接受 `VASurfaceAttribMemoryType` = VA | DRM_PRIME | DRM_PRIME_2 与 `VASurfaceAttribExternalBufferDescriptor`（每次一个 surface）。旧版 DRM_PRIME 不带修饰符，与 C 驱动一样只在设置 `NVD_DRM_PRIME_ASSUME_LINEAR` 时按线性接受；`vaQuerySurfaceAttributes` 也只在此时报告它，平时报告 VA | DRM_PRIME_2 和外部缓冲描述符。
+- Chrome：它只对认识的驱动用 DRM_PRIME_2 导入编码输入，其余用不带修饰符的旧版 DRM_PRIME，rustnv 无法确认其布局而拒绝，Chrome 也不会退回 `vaPutImage`。与 C 驱动相同，rustnv 在 Chrome GPU 进程里把 vendor 字符串加上 `Chromium fake libva driver compatible:` 前缀，使 Chrome 改走 DRM_PRIME_2（Chrome 156 中该类型只影响这一处）。
+- 修饰符：线性，以及 NVIDIA 块线性（无压缩、Turing+ GOB、块高 ≤ 32 行，即 `0x0300000000606010`–`15` 一族）。其余修饰符返回 `UNSUPPORTED_MEMORY`。
+- 导入的 surface 不能做解码目标，也不能 `vaPutImage`；可再经 `vaExportSurfaceHandle` 导出。`vaDestroySurfaces` 释放 import 与映射，1000 次 import/export/destroy 循环 RSS 与 fd 数不增长。
+- 解码 surface 经 `vaExportSurfaceHandle` 导出时，拷贝入共享 backing 的操作在导出时排队，消费方需在导出后 `vaSyncSurface` 再读。
+
+| 对照（640x360 / 1280x720 / 1920x1080 / 642x362） | rustnv | C 驱动 |
+|---|---|---|
+| NV12 线性 / 块线性 import，与 `vaPutImage` 码流逐字节一致 | 是（H.264、HEVC；块线性 `…6011`–`…6015` 全部） | 是 |
+| P010 import（HEVC Main10） | 是 | `vaCreateSurfaces` 失败 |
+| BGRA import | 是（线性与块线性码流相同；对 BT.709 参考 PSNR 约 38.6 dB） | `vaEndPicture` 失败（本测试程序下） |
+| 解码 → 编码 CPU 回读 | 无 | 无 |
+| 解码 surface 导出再 DRM_PRIME_2 导入编码 | 与直接转码逐字节一致 | 未测 |
+
+1080p 3000 帧 H.264 硬转码耗时：旧 rustnv（CPU 回读）288 s，现 rustnv 6.0 s，C 驱动 7.0 s；600 帧 user CPU 49.8 s → 0.25 s（C 0.26 s）。12000 帧 RSS 150 → 161 MiB 后持平。与旧驱动的 FFmpeg 转码（H.264/HEVC/AV1，8-bit，多尺寸；HEVC Main10 与 AV1 经 `hwupload` p010）输出逐字节一致。
+
+测试：`tests/encode.py` 的 `zero_copy` 编译 `tests/dmabuf_import.c`（Vulkan 分配外部 NV12/P010/BGRA，线性与块线性）与 `tests/dmabuf_export.c`（libav VA-API 解码后导出再导入），逐字节对照同内容 `vaPutImage`、BGRA PSNR 门限、1000 次循环 RSS/fd。
+
+### 遗留
+- BGRA 色彩转换仍在 CPU：RM 没有计算通道，copy engine 只能搬运。C 驱动这一路径本身在测试中失败。
+- 同步在 CPU 侧：解码完成与 copy engine 完成都由 CPU 等待，未做 GPU 侧 fence 串联。
+- 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。
+
+### Chrome 硬件编码（Chrome 156，Wayland 窗口，`--disable-gpu-sandbox`，临时 profile）
+
+| 测试页项目 | rustnv | C 驱动 |
+|---|---|---|
+| WebCodecs H.264 Baseline / High（`prefer-hardware`，720p） | 硬件编码，各 60 帧、2 个关键帧 | 相同 |
+| WebCodecs HEVC / AV1 | Chrome 不提供 | 相同 |
+| WebRTC H.264 / AV1 | Chrome 用软件编码器（OpenH264 / libaom），两驱动相同 | 相同 |
+| 硬件编码 720p 30 帧经软件解码与源画面 PSNR | 平均 28.10 dB、最低 27.96 dB | 平均 28.10 dB、最低 27.96 dB |
+
+Chrome 经 DRM_PRIME_2 导入 NV12（C 驱动下的 libva trace：两个 object 指向同一缓冲、修饰符 0 即线性、pitch 1280、UV 偏移 983040），由 copy engine 送入 NVENC，不经 CPU。软件编码同一画面 PSNR 约 36.9 dB；两驱动硬件结果完全相同，差距来自 Chrome 的 RGB→NV12 输入与码率，不在驱动。

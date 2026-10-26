@@ -1,5 +1,6 @@
 mod backend;
 mod encode;
+mod import;
 pub mod va;
 
 use std::{
@@ -291,6 +292,10 @@ struct Surface {
     output: Option<backend::Export>,
     output_dirty: bool,
     input: Option<encode::Input>,
+    /// A client's DRM PRIME buffer this surface was created over; the encoder reads it in place.
+    import: Option<Arc<import::Dma>>,
+    /// The encoder's view of `output`, created on first use.
+    backing: Option<Arc<import::Dma>>,
 }
 impl Surface {
     fn pending(&self) -> Vec<Arc<Completion>> {
@@ -357,6 +362,22 @@ impl Driver {
             .get(&id)
             .ok_or(VA_STATUS_ERROR_INVALID_BUFFER as VAStatus)
     }
+    /// Allocates the decode surface's stable exported backing on first use and queues the copy of
+    /// the latest decode into it.
+    fn ensure_output(&mut self, id: u32) -> R {
+        let s = self.surface(id)?;
+        if s.output.is_none() {
+            let (w, h) = (s.width, s.height);
+            if self.output_worker.is_none() {
+                self.output_worker = Some(OutputWorker::new(self.pci)?);
+            }
+            let output = self.output_worker.as_ref().unwrap().export(id, w, h)?;
+            let s = self.surfaces.get_mut(&id).unwrap();
+            s.output = Some(output);
+            s.output_dirty = s.decode.is_some();
+        }
+        self.update_output(id)
+    }
     /// Queues the copy into the exported backing after the latest decode; vaSyncSurface waits for it.
     fn update_output(&mut self, id: u32) -> R {
         let s = self.surfaces.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
@@ -373,19 +394,27 @@ impl Driver {
         Ok(())
     }
     fn export_output(&mut self, id: u32) -> R<backend::Export> {
-        let s = self.surface(id)?;
-        if s.output.is_none() {
-            let (w, h) = (s.width, s.height);
-            if self.output_worker.is_none() {
-                self.output_worker = Some(OutputWorker::new(self.pci)?);
-            }
-            let output = self.output_worker.as_ref().unwrap().export(id, w, h)?;
-            let s = self.surfaces.get_mut(&id).unwrap();
-            s.output = Some(output);
-            s.output_dirty = s.decode.is_some();
-        }
-        self.update_output(id)?;
+        self.ensure_output(id)?;
         gpu(self.surface(id)?.output.as_ref().ok_or(FAILED)?.try_clone())
+    }
+    /// What the encoder ingests for a picture on `id`: the client's imported buffer, or the GPU view
+    /// of a decode surface's exported backing, with the work that must complete before reading it.
+    fn encoder_source(&mut self, id: u32) -> R<Option<(Arc<import::Dma>, Vec<Arc<Completion>>)>> {
+        let s = self.surface(id)?;
+        if let Some(dma) = &s.import {
+            return Ok(Some((dma.clone(), Vec::new())));
+        }
+        if s.decode.is_none() {
+            return Ok(None);
+        }
+        self.ensure_output(id)?;
+        let s = self.surfaces.get_mut(&id).unwrap();
+        if s.backing.is_none() {
+            let o = s.output.as_ref().ok_or(FAILED)?;
+            let dma = import::Dma::from_backing(&o.fds[0], o.sizes[0], o.modifier, o.pitches[0], o.offsets[1], s.width, s.height)?;
+            s.backing = Some(Arc::new(dma));
+        }
+        Ok(Some((s.backing.clone().unwrap(), s.pending())))
     }
 }
 unsafe fn array<'a, T>(p: *const T, n: usize) -> R<&'a [T]> {
@@ -499,35 +528,71 @@ callback!(query_config(ctx, id: u32, p: *mut VAProfile, e: *mut VAEntrypoint, at
     out(p, profile)?; out(e, VAEntrypointVLD)?;
     out(attrs, VAConfigAttrib { type_: VAConfigAttribRTFormat, value: VA_RT_FORMAT_YUV420 })?; out(n, 1)
 });
-callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32, n: u32, attrs: *mut VASurfaceAttrib, na: u32) |d| {
-    dimensions(w, h, ENC_MAX_DIM)?;
-    if format & !(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV444 | VA_RT_FORMAT_YUV444_10) != 0 || format == 0 {
-        return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus);
-    }
-    if n == 0 || surfaces.is_null() { return Err(INVALID); }
+/// Surface creation parameters from `VASurfaceAttrib`: the picture format, and the client's DRM
+/// PRIME buffer when the surfaces wrap one (dimensions then come from the descriptor).
+unsafe fn surface_attributes(attrs: &[VASurfaceAttrib], format: u32, w: &mut u32, h: &mut u32) -> R<(u32, Option<Arc<import::Dma>>)> {
     let mut fourcc = match format {
         VA_RT_FORMAT_YUV420_10 => P010,
         VA_RT_FORMAT_YUV444 => YUV444P,
         VA_RT_FORMAT_YUV444_10 => Q416,
         _ => NV12,
     };
-    for a in array(attrs, na as usize)? {
+    let (mut memory, mut descriptor) = (0, ptr::null_mut());
+    for a in attrs {
         if a.flags & VA_SURFACE_ATTRIB_SETTABLE == 0 { continue; }
-        if a.value.type_ != VAGenericValueTypeInteger { return Err(INVALID); }
-        let v = a.value.value.i as u32;
         match a.type_ {
-            va::VASurfaceAttribPixelFormat if encode::INPUT_FORMATS.contains(&v) => { fourcc = v; },
-            va::VASurfaceAttribMemoryType if v == VA_SURFACE_ATTRIB_MEM_TYPE_VA => (),
+            va::VASurfaceAttribPixelFormat | va::VASurfaceAttribMemoryType | va::VASurfaceAttribUsageHint if a.value.type_ != VAGenericValueTypeInteger => return Err(INVALID),
+            va::VASurfaceAttribExternalBufferDescriptor if a.value.type_ != VAGenericValueTypePointer => return Err(INVALID),
+            va::VASurfaceAttribPixelFormat if encode::INPUT_FORMATS.contains(&(a.value.value.i as u32)) => fourcc = a.value.value.i as u32,
+            va::VASurfaceAttribPixelFormat if import::Kind::of(a.value.value.i as u32).is_some() => (),
+            va::VASurfaceAttribMemoryType => memory = a.value.value.i as u32,
+            va::VASurfaceAttribExternalBufferDescriptor => descriptor = a.value.value.p,
             va::VASurfaceAttribUsageHint => (),
-            va::VASurfaceAttribMemoryType => return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus),
             _ => return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus),
         }
     }
+    let supported = VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2;
+    if memory & !supported != 0 { return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus); }
+    let dma = if descriptor.is_null() || memory & (VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2) == 0 {
+        None
+    } else if memory & VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 != 0 {
+        Some(import::Dma::from_prime2(&*descriptor.cast::<VADRMPRIMESurfaceDescriptor>())?)
+    } else {
+        Some(import::Dma::from_prime(&*descriptor.cast::<VASurfaceAttribExternalBuffers>(), drm_prime_assume_linear())?)
+    };
+    if let Some(dma) = &dma {
+        fourcc = dma.fourcc;
+        if dma.width > 0 { *w = dma.width; }
+        if dma.height > 0 { *h = dma.height; }
+    }
+    Ok((fourcc, dma.map(Arc::new)))
+}
+/// Legacy DRM_PRIME carries no modifier, so it is honoured (as linear) only on request, as in the C driver.
+pub(crate) fn drm_prime_assume_linear() -> bool {
+    std::env::var("NVD_DRM_PRIME_ASSUME_LINEAR").is_ok_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+}
+/// Memory types offered to clients. Legacy DRM_PRIME stays hidden unless it can be honoured: Chrome imports
+/// through whatever is offered and would otherwise fail instead of falling back to vaPutImage.
+pub(crate) fn offered_memory_types() -> u32 {
+    let legacy = if drm_prime_assume_linear() { VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME } else { 0 };
+    VA_SURFACE_ATTRIB_MEM_TYPE_VA | VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 | legacy
+}
+callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32, n: u32, attrs: *mut VASurfaceAttrib, na: u32) |d| {
+    if format & !(VA_RT_FORMAT_YUV420 | VA_RT_FORMAT_YUV420_10 | VA_RT_FORMAT_YUV444 | VA_RT_FORMAT_YUV444_10 | VA_RT_FORMAT_RGB32) != 0 || format == 0 {
+        return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus);
+    }
+    if n == 0 || surfaces.is_null() { return Err(INVALID); }
+    let (mut w, mut h) = (w, h);
+    let (fourcc, import) = surface_attributes(array(attrs, na as usize)?, format, &mut w, &mut h)?;
+    if import.is_some() && n != 1 { return Err(INVALID); }
+    if format == VA_RT_FORMAT_RGB32 && import.is_none() { return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus); }
+    dimensions(w, h, ENC_MAX_DIM)?;
     for i in 0..n as usize {
         let id = d.id()?;
         d.surfaces.insert(id, Surface {
             width: w, height: h, fourcc, owner: None, worker: None, extent: (w, h),
             decode: None, copy: None, output: None, output_dirty: false, input: None,
+            import: import.clone(), backing: None,
         });
         surfaces.add(i).write(id);
     }
@@ -560,7 +625,13 @@ callback!(destroy_surfaces(ctx, ids: *mut u32, n: i32) |d| {
     for id in ids { d.surface(*id)?; if !seen.insert(*id) { return Err(INVALID); }
         if busy(d, *id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
     }
-    for id in ids { let s = d.surfaces.remove(id).unwrap(); if let Some(worker) = s.worker { worker.tx.send(Command::Release(*id)).map_err(|_| FAILED)?; } if s.output.is_some() { d.output_worker.as_ref().ok_or(FAILED)?.tx.send(OutputCommand::Release(*id)).map_err(|_| FAILED)?; } for c in d.contexts.values_mut() { c.targets.remove(id); } }
+    for id in ids {
+        let s = d.surfaces.remove(id).unwrap();
+        if let Some(worker) = s.worker { worker.tx.send(Command::Release(*id)).map_err(|_| FAILED)?; }
+        if s.output.is_some() { d.output_worker.as_ref().ok_or(FAILED)?.tx.send(OutputCommand::Release(*id)).map_err(|_| FAILED)?; }
+        for c in d.contexts.values_mut() { c.targets.remove(id); }
+        for session in d.enc_contexts.values() { session.forget(*id); }
+    }
     Ok(())
 });
 callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: *mut u32, n: i32, id: *mut u32) |d| {
@@ -628,6 +699,7 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
         return d.enc_contexts.get_mut(&id).unwrap().begin(target);
     }
     let s = d.surface(target)?; let c = d.context(id)?;
+    if s.import.is_some() { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
     if c.frame.is_some() { return Err(INVALID); }
     if (!c.targets.is_empty() && !c.targets.contains(&target)) || s.width < c.width || s.height < c.height { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
     if s.owner.is_some_and(|owner| owner != id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
@@ -693,34 +765,34 @@ fn prepare(f: &mut Frame) -> R<backend::Picture> {
     f.data.clear();
     Ok(backend::Picture { target: f.target, params, iq: f.iq.take(), slices, data })
 }
+/// Encodes the picture on a surface. A decoded surface (through its exported backing) and a client's
+/// imported buffer are read by the GPU in place; any other surface uses the planes the client uploaded.
+fn encode_picture(d: &mut Driver, id: u32) -> R {
+    let c = &d.enc_contexts[&id];
+    let target = c.target.ok_or(INVALID)?;
+    let coded = c.coded.ok_or(INVALID)?;
+    let (w, h) = d.surface(target)?.extent;
+    let frame = match d.encoder_source(target)? {
+        Some((dma, ready)) => encode::Frame::Dma { key: target, dma, ready },
+        None => encode::Frame::Cpu(d.surfaces.get_mut(&target).unwrap().input.take().ok_or(INVALID)?),
+    };
+    let c = d.enc_contexts.get_mut(&id).unwrap();
+    // VA sequence dimensions may be padded to coding-block boundaries; uploads
+    // retain the visible extent. Never ask RM to read beyond an input plane.
+    c.cfg.width = c.cfg.width.min(w as i32);
+    c.cfg.height = c.cfg.height.min(h as i32);
+    let output = std::mem::take(&mut d.buffers.get_mut(&coded).ok_or(INVALID)?.bytes);
+    let (input, output) = c.encode(frame, output)?;
+    if input.is_some() {
+        d.surfaces.get_mut(&target).unwrap().input = input;
+    }
+    d.buffers.get_mut(&coded).unwrap().bytes = output;
+    Ok(())
+}
 // Queues the decode and returns; its outcome is reported by vaSyncSurface.
 callback!(end_picture(ctx, id: u32) |d| {
     if d.enc_contexts.contains_key(&id) {
-        let c = &d.enc_contexts[&id];
-        let target = c.target.ok_or(INVALID)?;
-        let coded = c.coded.ok_or(INVALID)?;
-        let s = d.surface(target)?;
-        let (w, h) = s.extent;
-        // Decode surfaces currently cross the NVDEC/NVENC layouts through CPU readback.
-        if let Some(done) = s.decode.as_ref() {
-            done.wait()?;
-            let bytes = s.worker.as_ref().ok_or(INVALID)?.readback(target)?;
-            d.surfaces.get_mut(&target).unwrap().input = Some(encode::Input {
-                bytes, fourcc: NV12, pitch: w as usize,
-                offsets: [0, (w * h) as usize, 0],
-            });
-        }
-        let c = d.enc_contexts.get_mut(&id).unwrap();
-        // VA sequence dimensions may be padded to coding-block boundaries; uploads
-        // retain the visible extent. Never ask RM to read beyond an input plane.
-        c.cfg.width = c.cfg.width.min(w as i32);
-        c.cfg.height = c.cfg.height.min(h as i32);
-        let input = d.surfaces.get_mut(&target).unwrap().input.take().ok_or(INVALID)?;
-        let output = std::mem::take(&mut d.buffers.get_mut(&coded).ok_or(INVALID)?.bytes);
-        let (input, output) = c.encode(input, output)?;
-        d.surfaces.get_mut(&target).unwrap().input = Some(input);
-        d.buffers.get_mut(&coded).unwrap().bytes = output;
-        return Ok(());
+        return encode_picture(d, id);
     }
     let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     let mut f = c.frame.take().ok_or(INVALID)?;
@@ -872,6 +944,15 @@ fn surface_attr(kind: VASurfaceAttribType, value: u32, settable: bool) -> VASurf
     attr.value.value.i = value as i32;
     attr
 }
+/// `VASurfaceAttribExternalBufferDescriptor`: a pointer the client sets on creation.
+fn external_buffer_attr() -> VASurfaceAttrib {
+    let mut attr: VASurfaceAttrib = Default::default();
+    attr.type_ = VASurfaceAttribExternalBufferDescriptor;
+    attr.flags = VA_SURFACE_ATTRIB_GETTABLE | VA_SURFACE_ATTRIB_SETTABLE;
+    attr.value.type_ = VAGenericValueTypePointer;
+    attr.value.value.p = ptr::null_mut();
+    attr
+}
 callback!(query_surface_attrs(ctx, config: u32, attrs: *mut VASurfaceAttrib, n: *mut u32) |d| {
     encode::query_surface_attributes(d, config, attrs, n)
 });
@@ -879,6 +960,7 @@ callback!(export_surface(ctx, id: u32, mem_type: u32, flags: u32, descriptor: *m
     if mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 { return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus); }
     if flags & !(VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_COMPOSED_LAYERS) != 0 || flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0 && flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     if descriptor.is_null() { return Err(INVALID); }
+    if let Some(dma) = &d.surface(id)?.import { return out(descriptor.cast(), dma.export(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0)?); }
     let export = d.export_output(id)?;
     let s = d.surface(id)?;
     let mut desc: VADRMPRIMESurfaceDescriptor = zeroed(); desc.fourcc = NV12; desc.width = s.extent.0; desc.height = s.extent.1; desc.num_objects = 2;
@@ -1041,6 +1123,22 @@ unsafe fn drm_pci(ctx: VADriverContextP) -> Result<[u32; 4], String> {
     fields.try_into().map_err(|_| format!("unexpected PCI address {bdf:?}"))
 }
 
+// Chromium imports encoder input frames with the legacy DRM_PRIME descriptor, which carries no format
+// modifier, unless the vendor string names a driver it trusts with DRM_PRIME_2 (media/gpu/vaapi/
+// vaapi_wrapper.cc, VendorStringToImplementationType). NVIDIA GBM hands Chromium block-linear NV12, so the
+// legacy path cannot be honoured. In a Chromium GPU process the "Chromium fake libva driver" prefix, as in
+// the C driver, switches that import to DRM_PRIME_2; Chromium keys nothing else on it.
+fn vendor_string() -> &'static std::ffi::CStr {
+    // Chromium rewrites its argv into one space-joined string, so search the raw bytes.
+    let chromium = std::fs::read("/proc/self/cmdline")
+        .is_ok_and(|c| c.windows(18).any(|w| w == b"--type=gpu-process"));
+    if chromium {
+        c"Chromium fake libva driver compatible: Rust NVIDIA RM NVDEC/NVENC driver"
+    } else {
+        c"Rust NVIDIA RM NVDEC/NVENC driver"
+    }
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
     if ctx.is_null() || (*ctx).vtable.is_null() || !(*ctx).pDriverData.is_null() {
@@ -1123,7 +1221,7 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         (*ctx).max_image_formats = 4;
         (*ctx).max_subpic_formats = 1;
         (*ctx).max_display_attributes = 1;
-        (*ctx).str_vendor = b"Rust NVIDIA RM NVDEC/NVENC driver\0".as_ptr().cast();
+        (*ctx).str_vendor = vendor_string().as_ptr();
         (*ctx).pDriverData = Box::into_raw(Box::new(Mutex::new(Driver::new(pci)))).cast();
         (*ctx).vtable.write(table);
     })) {

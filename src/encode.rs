@@ -1,11 +1,11 @@
 //! VA-API encoding parameters and a thread-confined native RM session.
 #![allow(non_upper_case_globals)] // Match libva's public ABI constant spelling.
 use crate::{
-    array, count, dimensions, gpu, image_format, input_image, new_input, out, surface_attr, va::*,
-    Driver, ENC_MAX_DIM, FAILED, INVALID, MAX_DIM, NV12, P010, Q416, R, YUV444P,
+    array, count, dimensions, external_buffer_attr, gpu, image_format, import::{Dma, Kind}, input_image, new_input, out, surface_attr, va::*,
+    Completion, Driver, ENC_MAX_DIM, FAILED, INVALID, MAX_DIM, NV12, P010, Q416, R, YUV444P,
 };
 use nvrm::video::enc::{EncConfig, Encoder, ENC_AV1, ENC_H264, ENC_HEVC};
-use std::{mem::size_of, sync::mpsc, thread};
+use std::{mem::size_of, sync::{mpsc, Arc}, thread};
 
 pub const PROFILES: &[VAProfile] = &[
     VAProfileH264ConstrainedBaseline,
@@ -121,15 +121,27 @@ pub struct Input {
     pub pitch: usize,
     pub offsets: [usize; 3],
 }
+/// What the encoder reads for one picture: CPU-uploaded planes, or a dma-buf (a decode surface's
+/// exported backing or a client's imported buffer) that the copy engine ingests, once the work that
+/// produces it completed.
+pub enum Frame {
+    Cpu(Input),
+    Dma { key: u32, dma: Arc<Dma>, ready: Vec<Arc<Completion>> },
+}
+enum Message {
+    Encode(Request),
+    /// A surface was destroyed: drop its cached import.
+    Forget(u32),
+}
 struct Request {
     cfg: EncConfig,
     force: bool,
-    input: Input,
+    frame: Frame,
     output: Vec<u8>,
-    reply: mpsc::Sender<(Input, Vec<u8>, R)>,
+    reply: mpsc::Sender<(Option<Input>, Vec<u8>, R)>,
 }
 pub struct Session {
-    tx: mpsc::Sender<Request>,
+    tx: mpsc::Sender<Message>,
     join: Option<thread::JoinHandle<()>>,
     pub cfg: EncConfig,
     pub target: Option<u32>,
@@ -177,7 +189,7 @@ impl Session {
             cabac: p != VAProfileH264ConstrainedBaseline,
             ..Default::default()
         };
-        let (tx, rx) = mpsc::channel::<Request>();
+        let (tx, rx) = mpsc::channel::<Message>();
         let join = thread::Builder::new()
             .name("rustnv-nvenc".into())
             .spawn(move || {
@@ -185,7 +197,16 @@ impl Session {
                 let mut first = true;
                 let mut since_idr = 0u32;
                 let mut chroma = Vec::new();
-                while let Ok(mut r) = rx.recv() {
+                while let Ok(message) = rx.recv() {
+                    let mut r = match message {
+                        Message::Encode(r) => r,
+                        Message::Forget(key) => {
+                            if let Some(e) = enc.as_mut() {
+                                e.forget_dmabuf(u64::from(key));
+                            }
+                            continue;
+                        }
+                    };
                     let result = (|| {
                         if enc.is_none() {
                             enc = Some(gpu(
@@ -197,37 +218,10 @@ impl Session {
                         e.cfg.qp_p = r.cfg.qp_p;
                         e.cfg.min_qp = r.cfg.min_qp;
                         e.cfg.max_qp = r.cfg.max_qp;
-                        let i = &r.input;
-                        let y = &i.bytes[i.offsets[0]..];
-                        let uv = &i.bytes[i.offsets[1]..];
-                        gpu(match i.fourcc {
-                            P010 => e.load_p010(y, i.pitch, uv, i.pitch),
-                            YUV444P => e.load_yuv444(
-                                y,
-                                i.pitch,
-                                uv,
-                                i.pitch,
-                                &i.bytes[i.offsets[2]..],
-                                i.pitch,
-                            ),
-                            Q416 => {
-                                let w = e.cfg.width as usize;
-                                let h = e.cfg.height as usize;
-                                chroma.resize(w * h * 4, 0);
-                                let v = &i.bytes[i.offsets[2]..];
-                                for row in 0..h {
-                                    for x in 0..w {
-                                        let s = row * i.pitch + 2 * x;
-                                        let d = row * w * 4 + 4 * x;
-                                        chroma[d..d + 2].copy_from_slice(&uv[s..s + 2]);
-                                        chroma[d + 2..d + 4].copy_from_slice(&v[s..s + 2]);
-                                    }
-                                }
-                                e.load_x444(y, i.pitch, &chroma, w * 4)
-                            }
-                            _ => e.load_nv12(y, i.pitch, uv, i.pitch),
+                        match &r.frame {
+                            Frame::Cpu(input) => upload(e, input, &mut chroma)?,
+                            Frame::Dma { key, dma, ready } => ingest(e, *key, dma, ready)?,
                         }
-                        .map_err(|e| e.to_string()))?;
                         r.output.clear();
                         let t = gpu(e.submit(r.force).map_err(|e| e.to_string()))?;
                         // NVENC generates H.264/HEVC parameter sets; application copies are ignored.
@@ -245,7 +239,11 @@ impl Session {
                         }
                         Ok(())
                     })();
-                    let _ = r.reply.send((r.input, r.output, result));
+                    let input = match r.frame {
+                        Frame::Cpu(input) => Some(input),
+                        Frame::Dma { .. } => None,
+                    };
+                    let _ = r.reply.send((input, r.output, result));
                 }
             })
             .map_err(|_| FAILED)?;
@@ -423,14 +421,18 @@ impl Session {
         }
         Ok(())
     }
-    pub fn encode(&mut self, input: Input, output: Vec<u8>) -> R<(Input, Vec<u8>)> {
+    pub fn encode(&mut self, frame: Frame, output: Vec<u8>) -> R<(Option<Input>, Vec<u8>)> {
         self.target.take().ok_or(INVALID)?;
-        self.cfg.bit_depth = if matches!(input.fourcc, P010 | Q416) {
+        let fourcc = match &frame {
+            Frame::Cpu(input) => input.fourcc,
+            Frame::Dma { dma, .. } => dma.fourcc,
+        };
+        self.cfg.bit_depth = if matches!(fourcc, P010 | Q416) || Kind::of(fourcc) == Some(Kind::P01x) {
             10
         } else {
             8
         };
-        self.cfg.chroma444 = matches!(input.fourcc, YUV444P | Q416);
+        self.cfg.chroma444 = matches!(fourcc, YUV444P | Q416);
         let lo = self.cfg.min_qp.unwrap_or(0) as i32;
         let hi = (self
             .cfg
@@ -441,18 +443,60 @@ impl Session {
         self.cfg.qp_p = self.cfg.qp_p.clamp(lo, hi);
         let (tx, rx) = mpsc::channel();
         self.tx
-            .send(Request {
+            .send(Message::Encode(Request {
                 cfg: self.cfg.clone(),
                 force: self.force,
-                input,
+                frame,
                 output,
                 reply: tx,
-            })
+            }))
             .map_err(|_| FAILED)?;
         let (i, o, r) = rx.recv().map_err(|_| FAILED)?;
         r?;
         Ok((i, o))
     }
+    /// A surface was destroyed: its cached GPU import is dropped by the encoder thread.
+    pub fn forget(&self, surface: u32) {
+        let _ = self.tx.send(Message::Forget(surface));
+    }
+}
+/// CPU-side upload of planes the client wrote through `vaPutImage` or a derived image.
+fn upload(e: &mut Encoder, i: &Input, chroma: &mut Vec<u8>) -> R {
+    let y = &i.bytes[i.offsets[0]..];
+    let uv = &i.bytes[i.offsets[1]..];
+    gpu(match i.fourcc {
+        P010 => e.load_p010(y, i.pitch, uv, i.pitch),
+        YUV444P => e.load_yuv444(y, i.pitch, uv, i.pitch, &i.bytes[i.offsets[2]..], i.pitch),
+        Q416 => {
+            let w = e.cfg.width as usize;
+            let h = e.cfg.height as usize;
+            chroma.resize(w * h * 4, 0);
+            let v = &i.bytes[i.offsets[2]..];
+            for row in 0..h {
+                for x in 0..w {
+                    let s = row * i.pitch + 2 * x;
+                    let d = row * w * 4 + 4 * x;
+                    chroma[d..d + 2].copy_from_slice(&uv[s..s + 2]);
+                    chroma[d + 2..d + 4].copy_from_slice(&v[s..s + 2]);
+                }
+            }
+            e.load_x444(y, i.pitch, chroma, w * 4)
+        }
+        _ => e.load_nv12(y, i.pitch, uv, i.pitch),
+    }
+    .map_err(|e| e.to_string()))
+}
+/// GPU-side ingest of a dma-buf once the decode and copy that produce it completed.
+fn ingest(e: &mut Encoder, key: u32, dma: &Dma, ready: &[Arc<Completion>]) -> R {
+    for work in ready {
+        work.wait()?;
+    }
+    let source = dma.source()?;
+    gpu(match dma.kind {
+        Kind::Bgra => e.load_dmabuf_bgra(u64::from(key), &source),
+        _ => e.load_dmabuf(u64::from(key), &source),
+    }
+    .map_err(|e| e.to_string()))
 }
 impl Drop for Session {
     fn drop(&mut self) {
@@ -691,6 +735,9 @@ pub(super) unsafe fn create_image(
 
 pub(super) fn derive_input_image(d: &mut Driver, surface: u32) -> R<Option<VAImage>> {
     let s = d.surface(surface)?;
+    if s.import.is_some() {
+        return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
+    }
     if s.decode.is_some() {
         return Ok(None);
     }
@@ -721,6 +768,9 @@ pub(super) fn put_image(
         .ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?;
     let buffer = d.buffer(image.buf)?;
     let s = d.surface(surface)?;
+    if s.import.is_some() {
+        return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
+    }
     let (sx, sy, sw, sh) = src;
     let (dx, dy, dw, dh) = dst;
     if sx != 0
@@ -771,16 +821,13 @@ pub(super) unsafe fn query_surface_attributes(
         surface_attr(VASurfaceAttribMinHeight, 2, false),
         surface_attr(VASurfaceAttribMaxWidth, MAX_DIM, false),
         surface_attr(VASurfaceAttribMaxHeight, MAX_DIM, false),
-        surface_attr(
-            VASurfaceAttribMemoryType,
-            VA_SURFACE_ATTRIB_MEM_TYPE_VA,
-            true,
-        ),
+        surface_attr(VASurfaceAttribMemoryType, crate::offered_memory_types(), true),
         surface_attr(
             VASurfaceAttribUsageHint,
             VA_SURFACE_ATTRIB_USAGE_HINT_DECODER,
             true,
         ),
+        external_buffer_attr(),
     ];
     if let Some(&(profile, _)) = d.enc_configs.get(&config) {
         values[3] = surface_attr(VASurfaceAttribMaxWidth, ENC_MAX_DIM, false);
