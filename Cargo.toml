@@ -1,0 +1,17 @@
+[package]
+name = "rustnv-vaapi"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+
+[lib]
+name = "rustnv_drv_video"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Local development overrides this with a path [patch] in .cargo/config.toml (not committed).
+nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "75694b703943025d56d4fa6f9b76a9506329e681", default-features = false }
+
+[build-dependencies]
+bindgen = "0.72"
