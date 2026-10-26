@@ -4,6 +4,10 @@
 mod av1;
 mod h264;
 mod hevc;
+mod mpeg2;
+mod mpeg4;
+mod vc1;
+mod vp8;
 mod vp9;
 
 use crate::Format;
@@ -28,6 +32,10 @@ pub enum Codec {
     Hevc,
     Vp9,
     Av1,
+    Mpeg2,
+    Mpeg4,
+    Vc1,
+    Vp8,
 }
 
 /// One VA picture as submitted: raw parameter buffers, and complete slices (or tiles) whose data
@@ -210,6 +218,10 @@ impl Decoder {
             Codec::Hevc => hevc::create(class, width, height, format)?,
             Codec::Vp9 => vp9::create(class, width, height, format)?,
             Codec::Av1 => av1::create(class, width, height, format)?,
+            Codec::Mpeg2 => mpeg2::create(width, height)?,
+            Codec::Mpeg4 => mpeg4::create(width, height)?,
+            Codec::Vc1 => vc1::create(width, height)?,
+            Codec::Vp8 => vp8::create(width, height)?,
         };
         // The session pool holds dpb_size() + 2 surfaces before the extra slots.
         let base = codec.dpb_size() + 2;

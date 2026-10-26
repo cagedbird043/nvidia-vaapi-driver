@@ -9,14 +9,20 @@
 
 | 格式 | VA profile | surface / 图像格式 |
 |---|---|---|
+| MPEG-2 | Simple / Main | NV12 |
+| MPEG-4 part 2 | Simple / Advanced Simple / Main（无 sprite） | NV12 |
+| VC-1 / WMV3 | Simple / Main / Advanced | NV12 |
+| VP8 | Version 0–3 | NV12 |
 | H.264 | Constrained Baseline / Main / High | NV12 |
 | HEVC | Main / Main10 / Main12 | NV12 / P010 / P012 |
 | HEVC | Main444 / Main444_10 / Main444_12 | 444P / Q416 / Q416 |
 | VP9 | Profile 0 / Profile 2（10、12-bit） | NV12 / P010、P012 |
 | AV1 | Profile 0（8、10-bit） | NV12 / P010 |
 
-与 C 驱动的 VLD 列表相比，只缺 MPEG-2/MPEG-4/VC-1/VP8/JPEG（第 4–5 阶段）。VP9 Profile 2、AV1 的 surface 位深由 `vaCreateSurfaces` 的 RTFormat 决定，
-context 在第一帧按目标 surface 重建解码器。
+与系统里的 C 驱动的 VLD 列表相比，唯一的能力差距是 JPEG Baseline（见“旧格式”）。C 驱动的 `vainfo` 虽然列出 MPEG-4 的三个 profile，
+但 `vaCreateConfig` 对它们返回 `VA_STATUS_ERROR_UNSUPPORTED_PROFILE`（源码里 MPEG-4 已被注释禁用，`mpeg4.c` 自述“VA-API 给的信息不足以喂 NVDEC”），
+所以 C 驱动实际不能解 MPEG-4，rustnv 能；VC-1 Complex profile 没有对应的 VA profile，两个驱动都不涉及；C 源码的 MPEG-4 条目还含 H.263 Baseline（同被禁用），rustnv 不提供。
+VP9 Profile 2、AV1 的 surface 位深由 `vaCreateSurfaces` 的 RTFormat 决定，context 在第一帧按目标 surface 重建解码器。
 
 已验证的覆盖见下方“硬件回归”。
 
@@ -28,7 +34,8 @@ context 在第一帧按目标 surface 重建解码器。
 - 输出：NV12 CPU 下载；DRM PRIME2 的 R8 + RG88 分层或 NV12 合并描述符（块线性修饰符）。
 - 只在 libva 打开的那块 NVIDIA GPU 上解码；初始化时由 DRM fd 识别设备，非 nvidia 驱动的节点直接拒绝。
 
-解码明确拒绝并返回错误的情况：4:2:2、VP9/AV1 4:4:4、AV1 12-bit、隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
+解码明确拒绝并返回错误的情况：4:2:2、VP9/AV1 4:4:4、AV1 12-bit、H.264 隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
+MPEG-4 的 sprite（GMC）、H.263 短头、data partitioning 与 reversible VLC（NVDEC 的 MPEG-4 描述符没有这些字段，stock 解 data partitioning 的结果也是错的）、
 VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 与帧间 superres。不支持视频后处理。
 
 ### 编码（VAEntrypointEncSlice）
@@ -59,7 +66,7 @@ FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由�
 - surface 可以在解码前导出；导出的显存在 surface 生命周期内固定，每次解码后由 GPU copy engine 更新。显示路径没有 CPU 拷贝，
   有一次 GPU 拷贝。
 - 解码 context 销毁后，存活的 surface 仍持有 worker 和画面。
-- `src/backend/mod.rs` 管会话、导出和下载；`src/backend/{h264,hevc,vp9,av1}.rs` 各自把 VA 参数转换成 RM 的描述符输入。
+- `src/backend/mod.rs` 管会话、导出和下载；`src/backend/{h264,hevc,vp9,av1,mpeg2,mpeg4,vc1,vp8}.rs` 各自把 VA 参数转换成 RM 的描述符输入。
 
 RM 按 NVIDIA 驱动版本精确匹配 ABI，不认识的版本拒绝运行。Turing 及更新代的 NVDEC 全部启用，各代能力按 NVIDIA 驱动的代际规则
 和引擎能力表判断；本驱动实测范围仅为 RTX 4060 Laptop / nvidia-open 615.78.08 / x86_64 glibc。
@@ -178,6 +185,59 @@ Chrome 建 AV1 / VP9 Profile 2 的 config 时 RTFormat 只给 YUV420，随后才
 mpv 实时播放 H.264 4K60 两者都是 60 fps、0 丢帧。浏览器：Firefox 158 播放 H.264/HEVC/VP9/AV1 由 rustnv 解码；
 Chrome 156（关闭 GPU 沙箱，带 `--render-node-override`，见下）四种格式由 rustnv 解码，GPU 进程不加载 `libcuda`/`libnvcuvid`。
 
+## 旧格式（MPEG-2 / MPEG-4 / VC-1 / VP8）
+
+这四种格式由 NVDEC 引擎自己解析宏块层，VA 参数只填序列/图像层语法：RM 的 `video/legacy.rs` 提供通用的 `LegacyCodec<F: Format>`
+（VA surface 与会话 surface 的对应、前向/后向参考、场对），各格式只实现 `Format::build`（VA 参数 → NVDEC 描述符和方法序列）。
+描述符布局、方法序列和侧缓冲规则取自 stock libnvcuvid 615.78.08 的 RM 追踪（RM 仓库 `tools/nvdec-trace`），不经 CUDA。关键事实：
+
+- **MPEG-2**：引擎对每幅图像写两幅叠放的场图像（下场在上场之后）；copy engine 导出时按行交织成帧。场图像的第二场写进第一场所在的 surface。
+  切片起点表放在描述符 +0x200，码流是带起始码的切片。
+- **MPEG-4**：引擎自己解析 VOP 头，码流必须从 `00 00 01 b6` 开始。VA 客户端（libavcodec）只交出 VOP 头之后的宏块数据（`macroblock_offset` 是首字节内的位偏移），
+  所以驱动按 VA 参数重建 VOP 头（类型、时间戳、取整、`intra_dc_vlc_thr`、扫描位、`vop_quant`、f_code），再把宏块数据按位移接上。
+  VA 不带 VOP 时间戳，驱动用 `TRD`/`TRB` 推出一条时钟写进头里；实测 NVDEC 解带 `modulo_time_base` 的 I-VOP 会出错，所以 I-VOP 按 GOP 头之后的写法重新从 0 秒起算（与 ffmpeg 编码器的码流一致），P/B-VOP 照常带秒计数。
+  描述符 +0x5c 起是 VOL 语法（时间增量位数、resync、尺寸）、量化矩阵（光栅序）和 B-VOP 的 `trd/trb`；`error_status` 的第 3 位在正确的 B-VOP 上也会出现（stock 相同），不当作错误。
+- **VC-1 / WMV3**：引擎自己解析图像层（包括 bitplane），描述符只有序列和 entry point 语法；Simple/Main 没有起始码，引擎要求描述符里给帧起始码；
+  Advanced 的每个切片前补 `00 00 01 0d/0c/0b`。输出同样是两幅叠放的场图像。
+- **VP8**：引擎解析整个帧（头、概率、分区），描述符只有尺寸、帧类型和第一分区长度；会话开始时需要把一张固定初始表（`vp8_init.bin`，取自 stock 写入的 copy-engine 源缓冲）写进侧缓冲。
+
+校验方式（`tests/decode.py`，原 19 例之外的新用例）：
+
+| 格式 | 判定 | 样片 |
+|---|---|---|
+| MPEG-2 | 对软解 PSNR ≥ 45 dB；与 C 驱动逐字节一致 | 渐进、B 帧、隔行（场图像与帧图像）、自定义量化矩阵、非对齐、1080p |
+| MPEG-4 | 与 libnvcuvid（`mpeg4_cuvid`）逐字节一致；对软解 PSNR ≥ 40 dB | SP、ASP+B-VOP、qpel+4MV、隔行（`+ildct+ilme`，tff）、alternate scan、`-mpeg_quant 1` 自定义矩阵、resync marker、330×250 非对齐、120 帧长 GOP（跨秒时间戳）、720p、`testsrc2` |
+| VC-1 | 对软解逐字节一致，Advanced profile 样片对软解 PSNR ≥ 45 dB（色度有极小差异，C 驱动相同）；与 C 驱动逐字节一致 | samples.ffmpeg.org 上的 8 个样片，缓存在 `~/.cache/rustnv-samples`，缺失则跳过，`--fetch-samples` 经 http 下载 |
+| VP8 | 对软解逐字节一致；与 C 驱动逐字节一致 | altref、8 切片、1080p、全关键帧 |
+
+VC-1 样片（`http://samples.ffmpeg.org/` 下）：`V-codecs/WMV9/interlaced/480i30__codec_WVC1__mode_2__framerate_29.970__type_2__preproc_17.wmv`、
+`ffmpeg-bugs/roundup/issue948/{planet-vc1-bframe-bitexact,saylent-vc1-bitexact}.mkv`、`ffmpeg-bugs/trac/ticket2723/wmv9adv.wmv`、
+`ffmpeg-bugs/trac/ticket2993/vc1.wmv`、`archive/all/asf+wmv3+wmav2++audio_stutter.wmv`、`ffmpeg-bugs/trac/ticket5274/advanced_profile{,_2}.vc1`。
+
+MPEG-4 与软解的差异：在 mandelbrot（自然渐变）内容上最低 43.7 dB（隔行）；`testsrc2`（锐利、快速移动的测试图）的 B-VOP 有少数宏块与 libavcodec 解出不同，
+stock libnvcuvid 的输出与 rustnv 逐字节相同，所以差异在 NVDEC 引擎与 libavcodec 之间，不在描述符；该样片只以 libnvcuvid 为准。
+
+C 驱动对照：MPEG-2、VP8、VC-1 与 rustnv 逐字节一致；MPEG-4 在 C 驱动上不可用（`vaCreateConfig` 失败）。含损坏帧的 VC-1 样片（`asf+wmv3+0x0162++async_av.wmv`、
+`WMV9Drifting.asf`）上 rustnv 检查引擎状态，报 NVDEC 错误并丢弃 1–3 帧（输出帧数少于软解）；C 驱动照常输出全部帧，内容与 rustnv 不同。这两个样片不在回归里。
+
+旧格式 1080p 解码吞吐（ffmpeg `-hwaccel vaapi -f null`，3300 帧，两次计时相减去掉启动）与 3300 帧以上的连续解码（`-v warning` 无任何错误输出，RSS 热身后增量）：
+
+| 格式 | rustnv | C 驱动 | rustnv RSS 增量 |
+|---|---|---|---|
+| MPEG-2 | 860 fps | 812 fps | 0 KiB |
+| MPEG-4 | 871 fps | 不可用 | 12 KiB |
+| VC-1（saylent 拼接 3359 帧） | 774 fps | 776 fps | 0 KiB |
+| VP8 | 904 fps | 932 fps | 0 KiB |
+
+另有 VC-1 `vc1.wmv` 160×120 连续 4123 帧无错误。mpv `--hwdec=vaapi --hwdec-codecs=all --vo=gpu`（mpv 默认白名单不含 MPEG-2/MPEG-4）播放 MPEG-2、MPEG-4、VC-1、VP8，
+`vaEndPicture` 每 120 帧约 120 次，无丢帧；`--hwdec=vaapi-copy` 截图与软解 PSNR：MPEG-2 70.7 dB、MPEG-4 54.2 dB、VP8 inf。
+Chrome 156 播放 1080p VP8 webm（rustnv 与 C 驱动）8 秒：无解码错误、0 丢帧（rustnv 238 帧、C 210 帧）；Chrome 只对 H.264/VP8/VP9/AV1/HEVC 走 VA-API，MPEG-2/4、VC-1 不会进驱动。
+
+### JPEG 不支持
+
+C 驱动的 JPEG Baseline 经 libnvcuvid 的 JPEG 路径解码；RM 追踪显示 stock 的 JPEG 用内嵌的 CUDA 内核（`jpegparse`、`jpegdec_vld`、`jpegdec_idct`）完成，
+通道上只有计算与拷贝，没有 NVDEC / NVJPG 的方法。rustnv 不使用 CUDA，因此不提供 JPEG（`VAProfileJPEGBaseline`），这是与 C 驱动唯一的能力差距。
+
 ## 编码回归
 
 ```sh
@@ -241,7 +301,7 @@ C 驱动作为对照有自己的失败（只记录，不影响退出码）：AV1
 | C | 336192 KiB（第 324 帧） | 336264 KiB（第 2966 帧） | 72 KiB |
 
 两边均连续编码 3000 帧且严格解码无错误；RSS 在热身后基本稳定，上表保留实际测得的微小增量。
-`cargo build --release` 无警告；`tests/decode.py` 的 9 组全部逐字节一致；RM `cargo test --lib video::` 为 60 passed / 20 ignored；176 组 C/Rust NVENC 对照的 setup 和码流全部逐字节一致。
+`cargo build --release` 无警告；`tests/decode.py` 的 9 组全部逐字节一致；RM `cargo test --lib video::` 为 61 passed / 20 ignored；176 组 C/Rust NVENC 对照的 setup 和码流全部逐字节一致。
 
 ## 零拷贝编码输入（2c）
 

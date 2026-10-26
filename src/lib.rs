@@ -28,7 +28,16 @@ const ENC_MAX_DIM: u32 = 8192;
 const MAX_DIM: u32 = 4096;
 /// Decode profiles, as the C driver reports them on NVDEC hardware that decodes them all (VP9 and
 /// AV1 profiles above 0 4:2:0, and the 4:2:2 profiles, do not exist on NVDEC).
-const PROFILES: [VAProfile; 12] = [
+const PROFILES: [VAProfile; 21] = [
+    VAProfileMPEG2Simple,
+    VAProfileMPEG2Main,
+    VAProfileMPEG4Simple,
+    VAProfileMPEG4AdvancedSimple,
+    VAProfileMPEG4Main,
+    VAProfileVC1Simple,
+    VAProfileVC1Main,
+    VAProfileVC1Advanced,
+    VAProfileVP8Version0_3,
     VAProfileH264ConstrainedBaseline,
     VAProfileH264Main,
     VAProfileH264High,
@@ -49,6 +58,10 @@ fn codec_of(profile: VAProfile) -> R<backend::Codec> {
         va::VAProfileHEVCMain | va::VAProfileHEVCMain10 | va::VAProfileHEVCMain12 | va::VAProfileHEVCMain444 | va::VAProfileHEVCMain444_10 | va::VAProfileHEVCMain444_12 => Hevc,
         va::VAProfileVP9Profile0 | va::VAProfileVP9Profile2 => Vp9,
         va::VAProfileAV1Profile0 => Av1,
+        va::VAProfileMPEG2Simple | va::VAProfileMPEG2Main => Mpeg2,
+        va::VAProfileMPEG4Simple | va::VAProfileMPEG4AdvancedSimple | va::VAProfileMPEG4Main => Mpeg4,
+        va::VAProfileVC1Simple | va::VAProfileVC1Main | va::VAProfileVC1Advanced => Vc1,
+        va::VAProfileVP8Version0_3 => Vp8,
         _ => return Err(VA_STATUS_ERROR_UNSUPPORTED_PROFILE as VAStatus),
     })
 }
@@ -175,6 +188,10 @@ fn parameter_sizes(codec: backend::Codec) -> (usize, Option<usize>, usize) {
         Hevc => (size_of::<VAPictureParameterBufferHEVC>(), Some(size_of::<VAIQMatrixBufferHEVC>()), size_of::<VASliceParameterBufferHEVC>()),
         Vp9 => (size_of::<VADecPictureParameterBufferVP9>(), None, size_of::<VASliceParameterBufferVP9>()),
         Av1 => (size_of::<VADecPictureParameterBufferAV1>(), None, size_of::<VASliceParameterBufferAV1>()),
+        Vp8 => (size_of::<VAPictureParameterBufferVP8>(), Some(size_of::<VAIQMatrixBufferVP8>()), size_of::<VASliceParameterBufferVP8>()),
+        Vc1 => (size_of::<VAPictureParameterBufferVC1>(), None, size_of::<VASliceParameterBufferVC1>()),
+        Mpeg4 => (size_of::<VAPictureParameterBufferMPEG4>(), Some(size_of::<VAIQMatrixBufferMPEG4>()), size_of::<VASliceParameterBufferMPEG4>()),
+        Mpeg2 => (size_of::<VAPictureParameterBufferMPEG2>(), Some(size_of::<VAIQMatrixBufferMPEG2>()), size_of::<VASliceParameterBufferMPEG2>()),
     }
 }
 
@@ -588,7 +605,12 @@ fn attribute(profile: VAProfile, t: VAConfigAttribType) -> u32 {
         va::VAConfigAttribRTFormat => profile_rt(profile),
         va::VAConfigAttribDecSliceMode => VA_DEC_SLICE_MODE_NORMAL,
         va::VAConfigAttribDecProcessing => VA_DEC_PROCESSING_NONE,
-        va::VAConfigAttribMaxPictureWidth | va::VAConfigAttribMaxPictureHeight => MAX_DIM,
+        // Stock cuvidGetDecoderCaps on NVDEC: MPEG-2 4080, MPEG-4 and VC-1 2048, VP8 32768x16384.
+        va::VAConfigAttribMaxPictureWidth | va::VAConfigAttribMaxPictureHeight => match profile {
+            va::VAProfileMPEG2Simple | va::VAProfileMPEG2Main => 4080,
+            va::VAProfileMPEG4Simple | va::VAProfileMPEG4AdvancedSimple | va::VAProfileMPEG4Main | va::VAProfileVC1Simple | va::VAProfileVC1Main | va::VAProfileVC1Advanced => 2048,
+            _ => MAX_DIM,
+        },
         _ => VA_ATTRIB_NOT_SUPPORTED,
     }
 }
@@ -840,6 +862,8 @@ fn buffer_shape(codec: backend::Codec, kind: VABufferType, size: u32) -> bool {
         va::VAIQMatrixBufferType => iq == Some(size),
         va::VASliceParameterBufferType => size == slice || extended && size == slice_ext,
         va::VASliceDataBufferType => size != 0,
+        va::VABitPlaneBufferType => codec == backend::Codec::Vc1 && size != 0,
+        va::VAProbabilityBufferType => codec == backend::Codec::Vp8 && size as usize == size_of::<VAProbabilityDataBufferVP8>(),
         _ => false,
     }
 }
@@ -902,13 +926,19 @@ callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
             va::VAIQMatrixBufferType => { if f.iq.is_some() || b.count != 1 { return Err(INVALID); } f.iq = Some(b.bytes[..b.size as usize].to_vec()); }
             va::VASliceParameterBufferType => { let group = b.bytes[..b.size as usize * b.count as usize].chunks_exact(b.size as usize).map(<[u8]>::to_vec).collect(); f.events.push((true,f.groups.len())); f.groups.push(group); }
             va::VASliceDataBufferType => { f.events.push((false,f.data.len())); f.data.push(b.bytes[..b.size as usize * b.count as usize].to_vec()); }
+            // The engine reads VP8 probabilities from the frame itself.
+            va::VAProbabilityBufferType => {}
+            // The engine parses the VC-1 bitplanes from the slice data.
+            va::VABitPlaneBufferType => {}
             _ => return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus),
         }
     } Ok(())
 });
 /// Pairs every slice parameter element with its bytes, gathered into one contiguous data buffer.
 /// Every libva slice parameter struct starts with slice_data_size, slice_data_offset, slice_data_flag.
-fn prepare(f: &mut Frame) -> R<backend::Picture> {
+/// `whole_frame`: Chrome submits VP8 frames whole, with the offset past the frame header and the
+/// size of the whole frame; a size that only fits counted from the buffer start is read that way.
+fn prepare(f: &mut Frame, whole_frame: bool) -> R<backend::Picture> {
     let params = f.pic.take().ok_or(INVALID)?;
     if f.groups.is_empty() || f.data.is_empty() { return Err(INVALID); }
     // Offsets are relative to the associated data buffer. Preserve submission
@@ -937,7 +967,9 @@ fn prepare(f: &mut Frame) -> R<backend::Picture> {
         for param in group {
             let (size, offset, flag) = (field(&param, 0), field(&param, 1), field(&param, 2));
             if flag != VA_SLICE_DATA_FLAG_ALL as usize || size == 0 { return Err(INVALID); }
-            let bytes = source.get(offset..offset.checked_add(size).ok_or(INVALID)?).ok_or(INVALID)?;
+            let mut end = offset.checked_add(size).ok_or(INVALID)?;
+            if whole_frame && end > source.len() && size <= source.len() { end = size; }
+            let bytes = source.get(offset..end).ok_or(INVALID)?;
             let start = data.len(); data.extend_from_slice(bytes);
             slices.push(backend::Slice { param, data: start..data.len() });
         }
@@ -976,8 +1008,8 @@ callback!(end_picture(ctx, id: u32) |d| {
     }
     let c = d.contexts.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_CONTEXT as VAStatus)?;
     let mut f = c.frame.take().ok_or(INVALID)?;
-    let (worker, target) = (c.worker.clone(), f.target);
-    let (decode, status) = match prepare(&mut f) {
+    let (worker, target, vp8) = (c.worker.clone(), f.target, c.codec == backend::Codec::Vp8);
+    let (decode, status) = match prepare(&mut f, vp8) {
         Ok(picture) => (worker.queue(move |done| Command::Decode(picture, done)), Ok(())),
         Err(e) => (Completion::done(Err(e)), Err(e)),
     };
