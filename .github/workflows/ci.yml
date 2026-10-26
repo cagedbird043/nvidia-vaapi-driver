@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build-and-test:
+    # Arch ships a current libva (bindings need va_enc_av1.h and newer VA-API symbols);
+    # Ubuntu LTS headers lag behind.
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install toolchain and libva headers
+        run: pacman -Syu --noconfirm --needed base-devel git rust clang libva
+      - uses: actions/checkout@v4
+      - name: Check libva headers
+        run: |
+          pacman -Q libva
+          test -f /usr/include/va/va_enc_av1.h
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --release --locked
+      - name: Unit tests (no GPU required)
+        run: cargo test --release --locked
