@@ -10,7 +10,8 @@ name = "rustnv_drv_video"
 crate-type = ["cdylib"]
 
 [dependencies]
-nv-bionic-native = { path = "../waydroid-nvidia/nvidia-prolapse/driver-source/native", default-features = false }
+# Local development overrides this with a path [patch] in .cargo/config.toml (not committed).
+nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "f4b6c0c42478778b5d1a59bca33652a8de269f8a", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72"

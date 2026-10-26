@@ -1,7 +1,7 @@
 //! AV1 VA headers and tile payloads drive the RM descriptor machinery directly.
 use super::{read, Frontend, Picture};
 use crate::va;
-use nv_bionic_native::video::{
+use nvrm::video::{
     self,
     av1::{
         codec::Av1Decoder,

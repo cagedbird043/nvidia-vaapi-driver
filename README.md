@@ -32,12 +32,15 @@ mpv 的可选 CPU 上传探测会记录一次 `vaPutImage` 不支持，硬解显
 - 解码 context 销毁后，存活的 surface 仍持有 worker 和画面。
 - `src/backend/mod.rs` 管会话、导出和下载；`src/backend/{h264,hevc,vp9,av1}.rs` 各自把 VA 参数转换成 RM 的描述符输入。
 
-RM 按 NVIDIA 驱动版本精确匹配 ABI，不认识的版本拒绝运行。验证范围仅为 RTX 4060 Laptop / nvidia-open 615.78.08 / x86_64 glibc。
+RM 按 NVIDIA 驱动版本精确匹配 ABI，不认识的版本拒绝运行。Turing 及更新代的 NVDEC 全部启用，各代能力按 NVIDIA 驱动的代际规则
+和引擎能力表判断；本驱动实测范围仅为 RTX 4060 Laptop / nvidia-open 615.78.08 / x86_64 glibc。
 
 ## 构建
 
 依赖 Rust、Clang/libclang、libva 开发头文件；回归还需要 FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）。
-共享 RM 源码在相邻的 `../waydroid-nvidia/nvidia-prolapse/driver-source/native`。
+RM 来自 [nvrm](https://github.com/cagedbird043/nvrm)，`Cargo.toml` 按 commit 钉选。本地联调 RM 时在 `.cargo/config.toml`
+（不提交）里用 `[patch."https://github.com/cagedbird043/nvrm"]` 把 `nv-bionic-native` 指到本地 RM 目录；此时 cargo
+会去掉 `Cargo.lock` 里 nvrm 的 `source` 行，提交前不带 patch 重新生成。
 
 ```sh
 cargo build --release

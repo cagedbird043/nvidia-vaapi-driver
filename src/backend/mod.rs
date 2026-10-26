@@ -6,7 +6,7 @@ mod h264;
 mod hevc;
 mod vp9;
 
-use nv_bionic_native::video::{
+use nvrm::video::{
     self,
     session::{OutputAllocation, OutputAllocator, Session, SessionInfo, Target},
     SurfaceLayout,

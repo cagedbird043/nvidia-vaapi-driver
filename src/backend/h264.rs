@@ -2,7 +2,7 @@
 //! belongs to libva's client.
 use super::{Frontend, Picture};
 use crate::va;
-use nv_bionic_native::video::{
+use nvrm::video::{
     self,
     h264::{codec::H264Decoder, desc, legacy, ps, MAX_SLOTS},
     Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError,
@@ -156,7 +156,7 @@ impl CodecDecoder for VaCodec {
         // The engine's POC type-0 parser uses the stock biased domain, including
         // references on both sides of an IDR or a POC-LSB wrap.
         let bias = if sps.pic_order_cnt_type == 0 {
-            nv_bionic_native::video::h264::POC_TYPE0_BIAS
+            nvrm::video::h264::POC_TYPE0_BIAS
         } else {
             0
         };

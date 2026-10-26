@@ -5,7 +5,7 @@
 //! PCM, interlaced pictures, non-4:2:0 and non-8-bit surfaces are rejected.
 use super::{Frontend, Picture};
 use crate::va;
-use nv_bionic_native::video::{self, bits::{unescape, BitReader}, hevc::{self, codec::HevcDecoder, desc, ps}, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError};
+use nvrm::video::{self, bits::{unescape, BitReader}, hevc::{self, codec::HevcDecoder, desc, ps}, Allocator, BuildContext, CodecDecoder, DecodeJob, Job, PictureInfo, VResult, VideoError};
 use std::{cell::RefCell, collections::HashMap, rc::Rc};
 
 fn invalid(s: impl Into<String>) -> VideoError { VideoError::Invalid(s.into()) }

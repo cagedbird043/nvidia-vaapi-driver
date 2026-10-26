@@ -2,7 +2,7 @@
 //! four probability contexts and parses the complete frame's compressed header.
 use super::{Frontend, Picture};
 use crate::va;
-use nv_bionic_native::video::{
+use nvrm::video::{
     self, vp9::{VaPicture, Vp9Decoder}, Allocator, BuildContext, CodecDecoder,
     DecodeJob, Job, VResult, VideoError,
 };
