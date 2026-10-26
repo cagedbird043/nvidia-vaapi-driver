@@ -89,7 +89,7 @@ impl Frontend for Front {
             return Err("AV1 picture exceeds context dimensions".into());
         }
         if p.primary_ref_frame > 7
-            || p.ref_frame_idx.iter().any(|&i| i > 7)
+            || (pf & 1 != 0 && p.ref_frame_idx.iter().any(|&i| i > 7))
             || p.order_hint_bits_minus_1 > 7
             || p.cdef_bits > 3
             || (mc >> 7) & 3 > 2
@@ -151,7 +151,8 @@ impl Frontend for Front {
             render_height: height,
             order_hint: u32::from(p.order_hint),
             primary_ref_frame: p.primary_ref_frame,
-            ref_frame_idx: p.ref_frame_idx,
+            // Intra frames carry no reference indices: clients leave them unset (GStreamer: 255).
+            ref_frame_idx: if pf & 1 == 0 { [0; 7] } else { p.ref_frame_idx },
             interpolation_filter: p.interp_filter,
             is_filter_switchable: p.interp_filter == 4,
             base_q_idx: p.base_qindex,

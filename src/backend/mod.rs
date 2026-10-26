@@ -151,8 +151,8 @@ impl OutputPool {
     }
 
     pub fn export(&mut self, id: u32, width: u32, height: u32, format: Format) -> Result<Export, String> {
-        if width == 0 || height == 0 || width > 4096 || height > 4096 {
-            return Err("output dimensions must be within 1..4096".into());
+        if width == 0 || height == 0 || width > 8192 || height > 8192 {
+            return Err("output dimensions must be within 1..8192".into());
         }
         if let Some(backing) = self.surfaces.get(&id) {
             if (backing.width, backing.height, backing.format) != (width, height, format) {

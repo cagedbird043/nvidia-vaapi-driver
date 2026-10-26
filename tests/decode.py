@@ -66,6 +66,13 @@ CASES = [
     ("av1-10-tiles-crop", "av1", "850x478", 24, 96,
      ["-c:v", "libaom-av1", "-cpu-used", "8", "-b:v", "1M", "-g", "48", "-tile-columns", "1", "-tile-rows", "1"],
      "yuv420p10le", "P010"),
+    # 8192x4320：NVDEC 的 HEVC / VP9 / AV1 上限（vainfo 报告 8192），帧少以免软解与比较过慢。
+    ("hevc-8k", "hevc", "8192x4320", 30, 12,
+     ["-c:v", "libx265", "-preset", "ultrafast", "-x265-params", "log-level=error:keyint=6"]),
+    ("vp9-8k", "vp9", "8192x4320", 30, 12,
+     ["-c:v", "libvpx-vp9", "-deadline", "realtime", "-cpu-used", "8", "-g", "6"]),
+    ("av1-8k", "av1", "8192x4320", 30, 12,
+     ["-c:v", "libsvtav1", "-preset", "12", "-g", "6"]),
 ]
 
 

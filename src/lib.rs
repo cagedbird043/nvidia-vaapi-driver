@@ -1,6 +1,7 @@
 mod backend;
 mod encode;
 mod import;
+mod log;
 pub mod va;
 
 use std::{
@@ -10,10 +11,12 @@ use std::{
     os::fd::IntoRawFd,
     panic::{catch_unwind, AssertUnwindSafe},
     ptr, slice,
-    sync::{mpsc, Arc, Condvar, Mutex, MutexGuard},
+    sync::{atomic::{AtomicUsize, Ordering}, mpsc, Arc, Condvar, Mutex, MutexGuard},
     thread,
 };
 use va::*;
+/// VA displays open in this process.
+static INSTANCES: AtomicUsize = AtomicUsize::new(0);
 type R<T = ()> = Result<T, VAStatus>;
 const INVALID: VAStatus = VA_STATUS_ERROR_INVALID_PARAMETER as VAStatus;
 const FAILED: VAStatus = VA_STATUS_ERROR_OPERATION_FAILED as VAStatus;
@@ -25,7 +28,7 @@ const P016: u32 = u32::from_le_bytes(*b"P016");
 const YUV444P: u32 = u32::from_le_bytes(*b"444P");
 const Q416: u32 = u32::from_le_bytes(*b"Q416");
 const ENC_MAX_DIM: u32 = 8192;
-const MAX_DIM: u32 = 4096;
+const MAX_DIM: u32 = 8192;
 /// Decode profiles, as the C driver reports them on NVDEC hardware that decodes them all (VP9 and
 /// AV1 profiles above 0 4:2:0, and the 4:2:2 profiles, do not exist on NVDEC).
 const PROFILES: [VAProfile; 21] = [
@@ -224,6 +227,24 @@ impl Completion {
     }
     fn poll(&self) -> Option<R> {
         *self.result.lock().ok()?
+    }
+    /// Like `wait`, but gives up after `timeout`: `None` if the work is still running.
+    fn wait_timeout(&self, timeout: std::time::Duration) -> Option<R> {
+        let deadline = std::time::Instant::now().checked_add(timeout);
+        let mut slot = self.result.lock().ok()?;
+        loop {
+            if let Some(result) = *slot {
+                return Some(result);
+            }
+            let remaining = match deadline {
+                Some(deadline) => deadline.checked_duration_since(std::time::Instant::now())?,
+                None => std::time::Duration::from_secs(3600),
+            };
+            if remaining.is_zero() {
+                return None;
+            }
+            slot = self.ready.wait_timeout(slot, remaining).ok()?.0;
+        }
     }
     fn wait(&self) -> R {
         let mut slot = self.result.lock().map_err(|_| FAILED)?;
@@ -600,19 +621,28 @@ fn supported(p: VAProfile, e: VAEntrypoint) -> R {
         Ok(())
     }
 }
+fn max_decode_dim(profile: VAProfile) -> u32 {
+    match profile {
+        va::VAProfileMPEG2Simple | va::VAProfileMPEG2Main => 4080,
+        va::VAProfileMPEG4Simple | va::VAProfileMPEG4AdvancedSimple | va::VAProfileMPEG4Main | va::VAProfileVC1Simple | va::VAProfileVC1Main | va::VAProfileVC1Advanced => 2048,
+        va::VAProfileH264ConstrainedBaseline | va::VAProfileH264Main | va::VAProfileH264High | va::VAProfileVP8Version0_3 => 4096,
+        _ => MAX_DIM,
+    }
+}
 fn attribute(profile: VAProfile, t: VAConfigAttribType) -> u32 {
     match t {
         va::VAConfigAttribRTFormat => profile_rt(profile),
-        va::VAConfigAttribDecSliceMode => VA_DEC_SLICE_MODE_NORMAL,
-        va::VAConfigAttribDecProcessing => VA_DEC_PROCESSING_NONE,
-        // Stock cuvidGetDecoderCaps on NVDEC: MPEG-2 4080, MPEG-4 and VC-1 2048, VP8 32768x16384.
-        va::VAConfigAttribMaxPictureWidth | va::VAConfigAttribMaxPictureHeight => match profile {
-            va::VAProfileMPEG2Simple | va::VAProfileMPEG2Main => 4080,
-            va::VAProfileMPEG4Simple | va::VAProfileMPEG4AdvancedSimple | va::VAProfileMPEG4Main | va::VAProfileVC1Simple | va::VAProfileVC1Main | va::VAProfileVC1Advanced => 2048,
-            _ => MAX_DIM,
-        },
+        // What cuvidGetDecoderCaps reports on Ada NVDEC (H.264 and VP8 4096, MPEG-2 4080, MPEG-4 and VC-1 2048, the rest 8192).
+        va::VAConfigAttribMaxPictureWidth | va::VAConfigAttribMaxPictureHeight => max_decode_dim(profile),
         _ => VA_ATTRIB_NOT_SUPPORTED,
     }
+}
+/// Failed calls are traced under `NVD_LOG`.
+fn logged(name: &str, status: VAStatus) -> VAStatus {
+    if status != 0 {
+        log::log!("{name} failed: status {status}");
+    }
+    status
 }
 unsafe fn invoke(ctx: VADriverContextP, f: impl FnOnce(&mut Driver) -> R) -> VAStatus {
     invoke_unlocked(ctx, |m| f(&mut *lock(m)?))
@@ -645,12 +675,12 @@ fn readback(m: &Mutex<Driver>, id: u32) -> R<Vec<u8>> {
 }
 macro_rules! callback {
     ($name:ident($ctx:ident $(, $arg:ident : $ty:ty)*) |$d:ident| $body:block) => {
-        unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { invoke($ctx, |$d| $body) }
+        unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { log::debug!("{}", stringify!($name)); logged(stringify!($name), invoke($ctx, |$d| $body)) }
     };
 }
 macro_rules! callback_unlocked {
     ($name:ident($ctx:ident $(, $arg:ident : $ty:ty)*) |$m:ident| $body:block) => {
-        unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { invoke_unlocked($ctx, |$m| $body) }
+        unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { log::debug!("{}", stringify!($name)); logged(stringify!($name), invoke_unlocked($ctx, |$m| $body)) }
     };
 }
 callback!(query_profiles(ctx, list: *mut VAProfile, n: *mut i32) |_d| {
@@ -667,12 +697,12 @@ callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfig
     if e == VAEntrypointEncSlice { return encode::create_config(d, p, attrs, n, id); }
     supported(p, e)?; if id.is_null() { return Err(INVALID); }
     let mut rt = 0;
+    // As the C driver, only the render-target formats matter: the client names those it will use, and they must be among the profile's.
     for a in array(attrs, count(n)?)? {
+        if a.type_ != va::VAConfigAttribRTFormat { continue; }
         let value = attribute(p, a.type_);
-        // The client names the render-target formats it will use; they must be among the profile's.
-        let acceptable = if a.type_ == va::VAConfigAttribRTFormat { a.value & !value == 0 && a.value != 0 } else { a.value == value };
-        if value == VA_ATTRIB_NOT_SUPPORTED || !acceptable { return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus); }
-        if a.type_ == va::VAConfigAttribRTFormat { rt = a.value; }
+        if a.value & !value != 0 || a.value == 0 { return Err(VA_STATUS_ERROR_ATTR_NOT_SUPPORTED as VAStatus); }
+        rt = a.value;
     }
     let key = d.id()?; d.configs.insert(key, (p, rt)); out(id, key)
 });
@@ -796,6 +826,7 @@ callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: 
     let codec = codec_of(profile)?;
     let (format, adaptive) = context_format(d, profile, rt, &targets)?;
     let worker = Arc::new(Worker::new(codec, d.pci, w as u32, h as u32, targets.len(), format)?); let key = d.id()?;
+    log::log!("decode context {key}: {codec:?} {w}x{h} {} targets", targets.len());
     d.contexts.insert(key, Context { codec, format, adaptive, worker, width: w as u32, height: h as u32, targets, frame: None }); out(id, key)
 });
 /// The surface format a decode context produces. The profile fixes it, except VP9 profile 2 and
@@ -1027,9 +1058,21 @@ callback_unlocked!(sync_surface(ctx, id: u32) |m| {
     for work in pending { work.wait()?; }
     Ok(())
 });
-unsafe extern "C" fn sync_surface2(ctx: VADriverContextP, id: u32, _timeout: u64) -> VAStatus {
-    sync_surface(ctx, id)
-}
+// vaSyncSurface2: `timeout_ns` 0 only queries, u64::MAX waits as long as it takes; work still running when it
+// expires gives VA_STATUS_ERROR_TIMEDOUT.
+callback_unlocked!(sync_surface2(ctx, id: u32, timeout_ns: u64) |m| {
+    let pending = { let d = lock(m)?; let s = d.surface(id)?; if busy(&d, id) && timeout_ns == 0 { return Err(VA_STATUS_ERROR_TIMEDOUT as VAStatus); } s.pending() };
+    let timeout = std::time::Duration::from_nanos(timeout_ns);
+    let start = std::time::Instant::now();
+    for work in pending {
+        let left = timeout.saturating_sub(start.elapsed());
+        match if timeout_ns == u64::MAX { Some(work.wait()) } else { work.wait_timeout(left) } {
+            Some(result) => result?,
+            None => return Err(VA_STATUS_ERROR_TIMEDOUT as VAStatus),
+        }
+    }
+    Ok(())
+});
 callback!(query_status(ctx, id: u32, status: *mut VASurfaceStatus) |d| {
     let s = d.surface(id)?;
     let rendering = busy(d, id) || s.pending().iter().any(|work| work.poll().is_none());
@@ -1313,6 +1356,7 @@ unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
     }
     let data = (*ctx).pDriverData;
     (*ctx).pDriverData = ptr::null_mut();
+    INSTANCES.fetch_sub(1, Ordering::SeqCst);
     match catch_unwind(AssertUnwindSafe(|| {
         drop(Box::from_raw(data as *mut Mutex<Driver>))
     })) {
@@ -1321,21 +1365,9 @@ unsafe extern "C" fn terminate(ctx: VADriverContextP) -> VAStatus {
     }
 }
 
-/// PCI address of the NVIDIA GPU behind the DRM device libva opened for this display.
-/// Decoding on any other GPU would hand the application buffers its device cannot import.
-/// Uses only fstat on the fd and one sysfs file read, which sandboxed GPU processes (Chrome's
-/// broker allows /sys/dev/char/<major>:<minor>/device/...) still permit.
-unsafe fn drm_pci(ctx: VADriverContextP) -> Result<[u32; 4], String> {
-    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
-    let state = (*ctx).drm_state as *const drm_state;
-    if state.is_null() || (*state).fd < 0 {
-        return Err("the VA display has no DRM device".into());
-    }
-    let fd = BorrowedFd::borrow_raw((*state).fd);
-    let rdev = std::fs::File::from(fd.try_clone_to_owned().map_err(|e| format!("DRM fd: {e}"))?)
-        .metadata()
-        .map_err(|e| format!("DRM fd: {e}"))?
-        .rdev();
+/// PCI address of an NVIDIA DRM device given by its device number. Uses only the sysfs file under
+/// /sys/dev/char/<major>:<minor>, which sandboxed GPU processes (Chrome's broker) still permit.
+fn pci_of_rdev(rdev: u64) -> Result<[u32; 4], String> {
     let major = ((rdev >> 8) & 0xfff) | ((rdev >> 32) & !0xfff);
     let minor = (rdev & 0xff) | ((rdev >> 12) & !0xff);
     let path = format!("/sys/dev/char/{major}:{minor}/device/uevent");
@@ -1352,6 +1384,38 @@ unsafe fn drm_pci(ctx: VADriverContextP) -> Result<[u32; 4], String> {
         .collect::<Result<_, _>>()
         .map_err(|_| format!("unexpected PCI address {bdf:?}"))?;
     fields.try_into().map_err(|_| format!("unexpected PCI address {bdf:?}"))
+}
+/// The GPU to decode on, chosen as the C driver does: the NVIDIA DRM device libva opened for this display,
+/// unless `NVD_GPU` names an index; otherwise (a display on another vendor's GPU, or none) the
+/// `NVD_GPU`-th (default first) NVIDIA render node in /dev/dri/renderD128.. order.
+unsafe fn select_gpu(ctx: VADriverContextP) -> Result<[u32; 4], String> {
+    use std::os::{fd::BorrowedFd, unix::fs::MetadataExt};
+    let wanted = std::env::var("NVD_GPU").ok().map(|v| v.trim().parse::<i32>().unwrap_or(0));
+    let state = (*ctx).drm_state as *const drm_state;
+    if wanted.is_none() && !state.is_null() && (*state).fd >= 0 {
+        let fd = BorrowedFd::borrow_raw((*state).fd);
+        let from_fd = fd
+            .try_clone_to_owned()
+            .map_err(|e| format!("DRM fd: {e}"))
+            .and_then(|fd| std::fs::File::from(fd).metadata().map_err(|e| format!("DRM fd: {e}")))
+            .and_then(|m| pci_of_rdev(m.rdev()));
+        match from_fd {
+            Ok(pci) => return Ok(pci),
+            Err(e) => log::log!("display DRM device ignored: {e}"),
+        }
+    }
+    let index = usize::try_from(wanted.unwrap_or(0)).map_err(|_| "NVD_GPU must not be negative".to_string())?;
+    let mut nodes = 0;
+    for minor in 128..192 {
+        let Ok(meta) = std::fs::metadata(format!("/dev/dri/renderD{minor}")) else { continue };
+        let Ok(pci) = pci_of_rdev(meta.rdev()) else { continue };
+        if nodes == index {
+            log::log!("NVIDIA GPU {index} is /dev/dri/renderD{minor}");
+            return Ok(pci);
+        }
+        nodes += 1;
+    }
+    Err(format!("no NVIDIA GPU {index} found ({nodes} NVIDIA render nodes)"))
 }
 
 // Chromium imports encoder input frames with the legacy DRM_PRIME descriptor, which carries no format
@@ -1375,14 +1439,23 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
     if ctx.is_null() || (*ctx).vtable.is_null() || !(*ctx).pDriverData.is_null() {
         return INVALID;
     }
-    let pci = match drm_pci(ctx) {
+    let pci = match select_gpu(ctx) {
         Ok(pci) => pci,
         Err(e) => {
             eprintln!("rustnv: {e}");
             return VA_STATUS_ERROR_INVALID_DISPLAY as VAStatus;
         }
     };
-    match catch_unwind(AssertUnwindSafe(|| {
+    // NVD_MAX_INSTANCES caps the VA displays open in this process at once, as in the C driver.
+    let max = std::env::var("NVD_MAX_INSTANCES").ok().and_then(|v| v.trim().parse::<usize>().ok()).unwrap_or(0);
+    let open = INSTANCES.fetch_add(1, Ordering::SeqCst);
+    log::log!("now have {} ({max} max) instances", open + 1);
+    if max > 0 && open >= max {
+        INSTANCES.fetch_sub(1, Ordering::SeqCst);
+        return VA_STATUS_ERROR_HW_BUSY as VAStatus;
+    }
+    log::log!("initialising on PCI {pci:02x?}");
+    let status = match catch_unwind(AssertUnwindSafe(|| {
         let mut table: VADriverVTable = zeroed();
         table.vaTerminate = Some(terminate);
         table.vaQueryConfigProfiles = Some(query_profiles);
@@ -1458,5 +1531,9 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
     })) {
         Ok(()) => 0,
         Err(_) => FAILED,
+    };
+    if status != 0 {
+        INSTANCES.fetch_sub(1, Ordering::SeqCst);
     }
+    status
 }
