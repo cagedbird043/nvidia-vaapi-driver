@@ -199,7 +199,8 @@ Chrome 156（关闭 GPU 沙箱，带 `--render-node-override`，见下）四种�
   描述符 +0x5c 起是 VOL 语法（时间增量位数、resync、尺寸）、量化矩阵（光栅序）和 B-VOP 的 `trd/trb`；`error_status` 的第 3 位在正确的 B-VOP 上也会出现（stock 相同），不当作错误。
 - **VC-1 / WMV3**：引擎自己解析图像层（包括 bitplane），描述符只有序列和 entry point 语法；Simple/Main 没有起始码，引擎要求描述符里给帧起始码；
   Advanced 的每个切片前补 `00 00 01 0d/0c/0b`。输出同样是两幅叠放的场图像。
-- **VP8**：引擎解析整个帧（头、概率、分区），描述符只有尺寸、帧类型和第一分区长度；会话开始时需要把一张固定初始表（`vp8_init.bin`，取自 stock 写入的 copy-engine 源缓冲）写进侧缓冲。
+- **VP8**：引擎解析整个帧（头、概率、分区），描述符只有尺寸（按宏块对齐）、帧类型和第一分区长度；会话开始时需要把一张初始表（`vp8_init.bin`：RFC 6386 的默认系数、模式与运动矢量概率，按引擎布局排列，与 stock 写入 copy-engine 源缓冲的内容相同）写进侧缓冲。
+  Chrome 整帧提交：`slice_data_offset` 越过帧头，`slice_data_size` 却是整帧大小；越界时按“从缓冲起始计”的大小读取。
 
 校验方式（`tests/decode.py`，原 19 例之外的新用例）：
 
@@ -231,7 +232,14 @@ C 驱动对照：MPEG-2、VP8、VC-1 与 rustnv 逐字节一致；MPEG-4 在 C �
 
 另有 VC-1 `vc1.wmv` 160×120 连续 4123 帧无错误。mpv `--hwdec=vaapi --hwdec-codecs=all --vo=gpu`（mpv 默认白名单不含 MPEG-2/MPEG-4）播放 MPEG-2、MPEG-4、VC-1、VP8，
 `vaEndPicture` 每 120 帧约 120 次，无丢帧；`--hwdec=vaapi-copy` 截图与软解 PSNR：MPEG-2 70.7 dB、MPEG-4 54.2 dB、VP8 inf。
-Chrome 156 播放 1080p VP8 webm（rustnv 与 C 驱动）8 秒：无解码错误、0 丢帧（rustnv 238 帧、C 210 帧）；Chrome 只对 H.264/VP8/VP9/AV1/HEVC 走 VA-API，MPEG-2/4、VC-1 不会进驱动。
+浏览器播 1080p VP8 webm（120 帧，libva trace 统计 `vaEndPicture` 成功次数）：
+
+| 浏览器 | rustnv | C 驱动 |
+|---|---|---|
+| Chrome 156 | 硬解 120 帧，0 错误；截帧对软解 50.6 dB | `vaEndPicture` 报 invalid parameter（同样的整帧提交），退回软解 |
+| Firefox | 硬解 120 帧，0 错误 | 硬解 120 帧 |
+
+Chrome 只对 H.264/VP8/VP9/AV1/HEVC 走 VA-API，MPEG-2/4、VC-1 不会进驱动。
 
 ### JPEG 不支持
 
