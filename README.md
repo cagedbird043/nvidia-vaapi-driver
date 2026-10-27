@@ -21,6 +21,7 @@
 - 目标：Turing 及更新架构的 NVIDIA GPU，使用 **nvidia-open** 内核模块（专有模块不在测试范围）。
 - 只在 RTX 4060 Laptop（Ada）/ nvidia-open 615.78.08 / x86_64 glibc 上实测。
 - RM 按 NVIDIA 驱动版本精确匹配内核 ABI，不认识的版本会拒绝运行，所以支持的驱动版本取决于所用 nvrm 版本。
+- 0.2.2 钉选 nvrm `dce401d`，同步编码输入转换与会话后端更新。
 
 ## 安装
 
@@ -169,6 +170,7 @@ Maximum decode size: H.264 / VP8 4096, MPEG-2 4080, MPEG-4 / VC-1 2048, HEVC / V
 - Target: Turing and newer GPUs with the **nvidia-open** kernel modules (the proprietary modules are not tested).
 - Tested only on RTX 4060 Laptop (Ada) / nvidia-open 615.78.08 / x86_64 glibc.
 - RM matches the kernel ABI to the exact NVIDIA driver version and refuses unknown versions, so the supported driver versions depend on the nvrm revision in use.
+- Version 0.2.2 pins nvrm `dce401d`, including the updated encoding input conversion and session backend.
 
 ## Installation
 
