@@ -1,7 +1,7 @@
 //! External DRM PRIME buffers as VA surfaces. `Dma` is the validated, immutable description of a
 //! dma-buf-backed picture (a client's buffer, or a decode surface's exported backing); the encoder
 //! thread ingests it on the copy engine without touching the pixels on the CPU.
-use crate::{va::*, FAILED, INVALID, NV12, P010, R};
+use crate::{va::*, FAILED, INVALID, NV12, P010, Q416, R, YUV444P};
 use nvrm::video::enc::ingest;
 use std::{
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
@@ -24,6 +24,10 @@ pub enum Kind {
     Nv12,
     /// 16-bit containers holding 10..16 significant bits in the high bits, interleaved CbCr.
     P01x,
+    /// 8-bit 4:4:4, three planes (444P).
+    Yuv444,
+    /// 16-bit 4:4:4 with the samples in the high bits, three planes (Q416).
+    Q416,
     /// 8-bit B, G, R, A in memory order.
     Bgra,
 }
@@ -32,8 +36,24 @@ impl Kind {
         match fourcc {
             NV12 => Some(Kind::Nv12),
             P010 | P012 | P016 => Some(Kind::P01x),
+            YUV444P => Some(Kind::Yuv444),
+            Q416 => Some(Kind::Q416),
             VA_FOURCC_ARGB | VA_FOURCC_XRGB | AR24 | XR24 => Some(Kind::Bgra),
             _ => None,
+        }
+    }
+    fn planes(self) -> usize {
+        match self {
+            Kind::Bgra => 1,
+            Kind::Nv12 | Kind::P01x => 2,
+            Kind::Yuv444 | Kind::Q416 => 3,
+        }
+    }
+    fn bytes_per_sample(self) -> u32 {
+        match self {
+            Kind::Nv12 | Kind::Yuv444 => 1,
+            Kind::P01x | Kind::Q416 => 2,
+            Kind::Bgra => 4,
         }
     }
 }
@@ -53,7 +73,7 @@ pub struct Dma {
     objects: Vec<OwnedFd>,
     sizes: Vec<u32>,
     modifiers: Vec<u64>,
-    /// Two planes (luma, CbCr) for the YUV kinds, one for BGRA.
+    /// Luma and CbCr for 4:2:0, luma, Cb and Cr for 4:4:4, one plane for BGRA.
     planes: Vec<Plane>,
 }
 
@@ -90,7 +110,7 @@ impl Dma {
             eprintln!("rustnv: unsupported external fourcc {fourcc:#x}");
             UNSUPPORTED_MEMORY
         })?;
-        let wanted = if kind == Kind::Bgra { 1 } else { 2 };
+        let wanted = kind.planes();
         if planes.len() < wanted || objects.is_empty() || planes.iter().any(|p| p.object >= objects.len()) {
             return Err(INVALID);
         }
@@ -143,27 +163,24 @@ impl Dma {
         let modifiers = vec![DRM_FORMAT_MOD_LINEAR; buffers];
         Self::new(ext.pixel_format, ext.width, ext.height, fds, modifiers, planes)
     }
-    /// A decode surface's exported backing (one dma-buf, luma then CbCr at `chroma_offset`); only the
-    /// 4:2:0 formats the encoder ingests.
-    pub fn from_backing(fourcc: u32, fd: &OwnedFd, size: u32, modifier: u64, pitch: u32, chroma_offset: u32, width: u32, height: u32) -> R<Self> {
+    /// A decode surface's exported backing: one dma-buf holding luma then the chroma planes at
+    /// `offsets[1]` (CbCr) for 4:2:0, or `offsets[1]` (Cb) and `offsets[2]` (Cr) for 4:4:4.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_backing(fourcc: u32, fd: &OwnedFd, size: u32, modifier: u64, pitch: u32, offsets: [u32; 3], width: u32, height: u32) -> R<Self> {
         let kind = Kind::of(fourcc).filter(|k| *k != Kind::Bgra).ok_or(INVALID)?;
-        let planes = vec![
-            Plane { object: 0, offset: 0, pitch },
-            Plane { object: 0, offset: chroma_offset, pitch },
-        ];
+        let planes = offsets[..kind.planes()].iter().map(|&offset| Plane { object: 0, offset, pitch }).collect();
         let objects = vec![fd.try_clone().map_err(|_| FAILED)?];
         let dma = Self { fourcc, kind, width, height, objects, sizes: vec![size], modifiers: vec![modifier], planes };
         dma.source()?;
         Ok(dma)
     }
     fn layout(&self) -> R<ingest::Layout> {
-        let used = if self.kind == Kind::Bgra { 1 } else { 2 };
         let first = ingest::layout_from_modifier(self.modifiers[self.planes[0].object]);
         let layout = first.ok_or_else(|| {
             eprintln!("rustnv: unsupported dma-buf modifier {:#x}", self.modifiers[self.planes[0].object]);
             ALLOCATION
         })?;
-        for plane in &self.planes[..used] {
+        for plane in &self.planes[..self.kind.planes()] {
             if ingest::layout_from_modifier(self.modifiers[plane.object]) != Some(layout) {
                 return Err(ALLOCATION);
             }
@@ -177,17 +194,27 @@ impl Dma {
             ingest::Plane { fd: self.objects[p.object].as_raw_fd(), offset: u64::from(p.offset), pitch: p.pitch }
         };
         Ok(ingest::Source {
-            planes: [plane(0), plane(1)],
+            planes: [plane(0), plane(1), plane(2)],
             layout: self.layout()?,
-            bytes_per_sample: match self.kind {
-                Kind::Nv12 => 1,
-                Kind::P01x => 2,
-                Kind::Bgra => 4,
-            },
+            bytes_per_sample: self.kind.bytes_per_sample(),
+            chroma444: matches!(self.kind, Kind::Yuv444 | Kind::Q416),
         })
     }
     /// Duplicated objects and per-plane geometry for `vaExportSurfaceHandle`.
     pub fn export(&self, composed: bool) -> R<VADRMPRIMESurfaceDescriptor> {
+        let planes = self.kind.planes();
+        let composed_format = match self.kind {
+            Kind::Bgra => Some(AR24),
+            Kind::Yuv444 => Some(u32::from_le_bytes(*b"YU24")),
+            Kind::Q416 => None,
+            Kind::Nv12 | Kind::P01x => Some(self.fourcc),
+        };
+        let layers = if composed || planes == 1 { 1 } else { planes };
+        let layer_format = if layers == 1 {
+            composed_format.ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?
+        } else {
+            0
+        };
         let mut desc = VADRMPRIMESurfaceDescriptor { fourcc: self.fourcc, width: self.width, height: self.height, num_objects: self.objects.len() as u32, ..Default::default() };
         for (i, fd) in self.objects.iter().enumerate() {
             let copy = fd.try_clone().map_err(|_| FAILED)?;
@@ -196,18 +223,16 @@ impl Dma {
             desc.objects[i].drm_format_modifier = self.modifiers[i];
         }
         let drm = |p: usize| match (self.kind, p) {
-            (Kind::Nv12, 0) => u32::from_le_bytes(*b"R8  "),
+            (Kind::Nv12 | Kind::Yuv444, 0) | (Kind::Yuv444, _) => u32::from_le_bytes(*b"R8  "),
             (Kind::Nv12, _) => u32::from_le_bytes(*b"RG88"),
-            (Kind::P01x, 0) => u32::from_le_bytes(*b"R16 "),
+            (Kind::P01x | Kind::Q416, 0) | (Kind::Q416, _) => u32::from_le_bytes(*b"R16 "),
             (Kind::P01x, _) => u32::from_le_bytes(*b"RG32"),
             (Kind::Bgra, _) => AR24,
         };
-        let planes = if self.kind == Kind::Bgra { 1 } else { 2 };
-        let layers = if composed || planes == 1 { 1 } else { planes };
         desc.num_layers = layers as u32;
         for (l, layer) in desc.layers[..layers].iter_mut().enumerate() {
             let covered = if layers == 1 { planes } else { 1 };
-            layer.drm_format = if layers == 1 { self.fourcc_drm() } else { drm(l) };
+            layer.drm_format = if layers == 1 { layer_format } else { drm(l) };
             layer.num_planes = covered as u32;
             for k in 0..covered {
                 let p = self.planes[if layers == 1 { k } else { l }];
@@ -217,12 +242,6 @@ impl Dma {
             }
         }
         Ok(desc)
-    }
-    fn fourcc_drm(&self) -> u32 {
-        match self.kind {
-            Kind::Bgra => AR24,
-            _ => self.fourcc,
-        }
     }
 }
 
@@ -237,6 +256,8 @@ mod tests {
         assert_eq!(Kind::of(VA_FOURCC_P016), Some(Kind::P01x));
         assert_eq!(Kind::of(AR24), Some(Kind::Bgra));
         assert_eq!(Kind::of(VA_FOURCC_ARGB), Some(Kind::Bgra));
-        assert_eq!(Kind::of(u32::from_le_bytes(*b"444P")), None);
+        assert_eq!(Kind::of(u32::from_le_bytes(*b"444P")), Some(Kind::Yuv444));
+        assert_eq!(Kind::of(u32::from_le_bytes(*b"Q416")), Some(Kind::Q416));
+        assert_eq!(Kind::of(u32::from_le_bytes(*b"YUY2")), None);
     }
 }

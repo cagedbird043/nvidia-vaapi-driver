@@ -586,7 +586,7 @@ impl Driver {
         let s = self.surfaces.get_mut(&id).unwrap();
         if s.backing.is_none() {
             let o = s.output.as_ref().ok_or(FAILED)?;
-            let dma = import::Dma::from_backing(s.fourcc, &o.fds[0], o.size, o.modifier, o.pitches[0], o.offsets[1], s.width, s.height)?;
+            let dma = import::Dma::from_backing(s.fourcc, &o.fds[0], o.size, o.modifier, o.pitches[0], o.offsets, s.width, s.height)?;
             s.backing = Some(Arc::new(dma));
         }
         Ok(Some((s.backing.clone().unwrap(), s.pending())))

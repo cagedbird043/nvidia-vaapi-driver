@@ -1,5 +1,5 @@
-// DMA-BUF import test: Vulkan allocates NV12/P010/BGRA (linear or block-linear), VA encodes it.
-// usage: imp <render node> <codec h264|hevc> <fmt nv12|p010|bgra> <src put|linear|bl> <w> <h> <frames> <out> [cycles]
+// DMA-BUF import test: Vulkan allocates NV12/P010/444P/Q416/BGRA (linear or block-linear), VA encodes it.
+// usage: imp <render node> <codec h264|hevc> <fmt nv12|p010|444p|q416|bgra> <src put|linear|bl> <w> <h> <frames> <out> [cycles]
 #define VK_NO_PROTOTYPES
 #include <vulkan/vulkan.h>
 #include <va/va.h>
@@ -22,15 +22,19 @@ static VkInstance inst; static VkPhysicalDevice pd; static VkDevice dev; static 
 #define DP(n) PFN_##n n=(PFN_##n)gdpa(dev,#n)
 static int w,h,hevc,bits=10000000;
 static const char *fmt;
-static int bpp(void){return !strcmp(fmt,"p010")?2:1;}
+static int bpp(void){return !strcmp(fmt,"p010")||!strcmp(fmt,"q416")?2:1;}
+static int full(void){return !strcmp(fmt,"444p")||!strcmp(fmt,"q416");}
+static void sample(unsigned char *plane,size_t i,int v){if(bpp()==1)plane[i]=v;else((unsigned short*)plane)[i]=v<<8|(v&0xc0);}
 static void pattern(unsigned char *y,unsigned char *uv,unsigned char *bgra,int n){
     int b=bpp();
     if(bgra){for(int j=0;j<h;j++)for(int i=0;i<w;i++){unsigned char*p=bgra+((size_t)j*w+i)*4;p[0]=(i*2+n*3+(j&7)*5)&255;p[1]=(j*2+n*5+(i&3)*9)&255;p[2]=((i+j)+n*7)&255;p[3]=255;}return;}
     for(int j=0;j<h;j++)for(int i=0;i<w;i++){int v=(i*3+j*2+n*5+((i^j)&15)*4)&255; if(b==1)y[(size_t)j*w+i]=v; else ((unsigned short*)y)[(size_t)j*w+i]=v<<8|(v&0xc0);}
+    if(full()){size_t ysz=(size_t)w*h*b;for(int j=0;j<h;j++)for(int i=0;i<w;i++){sample(uv,(size_t)j*w+i,(i*5+j+n*3+((i>>2)^j)*7)&255);sample(uv+ysz,(size_t)j*w+i,(i+j*4+n*9+(i^(j>>1))*3)&255);}return;}
     for(int j=0;j<h/2;j++)for(int i=0;i<w/2;i++){int u=(i*5+j+n*3)&255,v=(i+j*4+n*9)&255; if(b==1){uv[(size_t)j*w+2*i]=u;uv[(size_t)j*w+2*i+1]=v;}else{((unsigned short*)uv)[(size_t)j*w+2*i]=u<<8;((unsigned short*)uv)[(size_t)j*w+2*i+1]=v<<8;}}
 }
 typedef struct { VkImage img; VkDeviceMemory mem; VkBuffer buf; VkDeviceMemory bmem; void *bmap; int fd; uint64_t mod; uint64_t size; int np; int off[3],pitch[3]; VkCommandPool pool; VkCommandBuffer cb; VkFence fence; } Vk;
-static VkFormat vkfmt(void){return !strcmp(fmt,"nv12")?VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:!strcmp(fmt,"p010")?VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:VK_FORMAT_B8G8R8A8_UNORM;}
+static VkFormat vkfmt(void){return !strcmp(fmt,"nv12")?VK_FORMAT_G8_B8R8_2PLANE_420_UNORM:!strcmp(fmt,"p010")?VK_FORMAT_G10X6_B10X6R10X6_2PLANE_420_UNORM_3PACK16:
+    !strcmp(fmt,"444p")?VK_FORMAT_G8_B8_R8_3PLANE_444_UNORM:!strcmp(fmt,"q416")?VK_FORMAT_G16_B16_R16_3PLANE_444_UNORM:VK_FORMAT_B8G8R8A8_UNORM;}
 static uint32_t memtype(uint32_t bits,VkMemoryPropertyFlags want){VkPhysicalDeviceMemoryProperties mp;((PFN_vkGetPhysicalDeviceMemoryProperties)gipa(inst,"vkGetPhysicalDeviceMemoryProperties"))(pd,&mp);for(uint32_t i=0;i<mp.memoryTypeCount;i++)if((bits&(1u<<i))&&(mp.memoryTypes[i].propertyFlags&want)==want)return i;fprintf(stderr,"no memtype\n");exit(1);}
 static void vk_init(void){
     void *lib=dlopen("libvulkan.so.1",RTLD_NOW);gipa=dlsym(lib,"vkGetInstanceProcAddr");
@@ -88,10 +92,11 @@ static void vk_upload(Vk *v,int n){
     unsigned char *base=v->bmap;size_t ysz=(size_t)w*h*b;
     if(bgra)pattern(0,0,base,n);else pattern(base,base+ysz,0,n);
     vkResetCommandBuffer(v->cb,0);VkCommandBufferBeginInfo bi={VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,0,VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT};vkBeginCommandBuffer(v->cb,&bi);
-    VkImageAspectFlags asp=bgra?VK_IMAGE_ASPECT_COLOR_BIT:(VK_IMAGE_ASPECT_PLANE_0_BIT|VK_IMAGE_ASPECT_PLANE_1_BIT);
+    VkImageAspectFlags asp=bgra?VK_IMAGE_ASPECT_COLOR_BIT:(VK_IMAGE_ASPECT_PLANE_0_BIT|VK_IMAGE_ASPECT_PLANE_1_BIT|(full()?VK_IMAGE_ASPECT_PLANE_2_BIT:0));
     VkImageMemoryBarrier br={VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,0,0,VK_ACCESS_TRANSFER_WRITE_BIT,VK_IMAGE_LAYOUT_UNDEFINED,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,VK_QUEUE_FAMILY_IGNORED,VK_QUEUE_FAMILY_IGNORED,v->img,{asp,0,1,0,1}};
     vkCmdPipelineBarrier(v->cb,VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,VK_PIPELINE_STAGE_TRANSFER_BIT,0,0,0,0,0,1,&br);
     if(bgra){VkBufferImageCopy c={0,0,0,{VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},{0,0,0},{w,h,1}};vkCmdCopyBufferToImage(v->cb,v->buf,v->img,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,1,&c);}
+    else if(full()){VkBufferImageCopy c[3];for(int p=0;p<3;p++)c[p]=(VkBufferImageCopy){ysz*p,0,0,{VK_IMAGE_ASPECT_PLANE_0_BIT<<p,0,0,1},{0,0,0},{w,h,1}};vkCmdCopyBufferToImage(v->cb,v->buf,v->img,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,3,c);}
     else{VkBufferImageCopy c[2]={{0,0,0,{VK_IMAGE_ASPECT_PLANE_0_BIT,0,0,1},{0,0,0},{w,h,1}},{ysz,0,0,{VK_IMAGE_ASPECT_PLANE_1_BIT,0,0,1},{0,0,0},{w/2,h/2,1}}};vkCmdCopyBufferToImage(v->cb,v->buf,v->img,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,2,c);}
     br.srcAccessMask=VK_ACCESS_TRANSFER_WRITE_BIT;br.dstAccessMask=0;br.oldLayout=VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;br.newLayout=VK_IMAGE_LAYOUT_GENERAL;
     vkCmdPipelineBarrier(v->cb,VK_PIPELINE_STAGE_TRANSFER_BIT,VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,0,0,0,0,0,1,&br);
@@ -101,13 +106,17 @@ static void vk_upload(Vk *v,int n){
 static VASurfaceID import_surface(VADisplay d,Vk *v,int fd){
     VADRMPRIMESurfaceDescriptor desc={0};
     int bgra=!strcmp(fmt,"bgra");
-    desc.fourcc=bgra?VA_FOURCC_ARGB:!strcmp(fmt,"nv12")?VA_FOURCC_NV12:VA_FOURCC_P010;
+    desc.fourcc=bgra?VA_FOURCC_ARGB:!strcmp(fmt,"nv12")?VA_FOURCC_NV12:!strcmp(fmt,"444p")?VA_FOURCC_444P:!strcmp(fmt,"q416")?VA_FOURCC_Q416:VA_FOURCC_P010;
     desc.width=w;desc.height=h;desc.num_objects=1;desc.objects[0].fd=fd;desc.objects[0].size=v->size;desc.objects[0].drm_format_modifier=v->mod;
+    if(full()){ // one R8/R16 layer per plane: Q416 has no DRM fourcc
+        desc.num_layers=3;for(int p=0;p<3;p++){desc.layers[p].drm_format=bpp()==2?DRM_FORMAT_R16:DRM_FORMAT_R8;desc.layers[p].num_planes=1;desc.layers[p].object_index[0]=0;desc.layers[p].offset[0]=v->off[p];desc.layers[p].pitch[0]=v->pitch[p];}
+    }else{
     desc.num_layers=1;desc.layers[0].drm_format=bgra?DRM_FORMAT_ARGB8888:!strcmp(fmt,"nv12")?DRM_FORMAT_NV12:DRM_FORMAT_P010;
     desc.layers[0].num_planes=v->np;for(int p=0;p<v->np;p++){desc.layers[0].object_index[p]=0;desc.layers[0].offset[p]=v->off[p];desc.layers[0].pitch[p]=v->pitch[p];}
+    }
     VASurfaceAttrib at[2]={{.type=VASurfaceAttribMemoryType,.flags=VA_SURFACE_ATTRIB_SETTABLE,.value={.type=VAGenericValueTypeInteger,.value.i=VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2}},
                            {.type=VASurfaceAttribExternalBufferDescriptor,.flags=VA_SURFACE_ATTRIB_SETTABLE,.value={.type=VAGenericValueTypePointer,.value.p=&desc}}};
-    unsigned rt=bgra?VA_RT_FORMAT_RGB32:!strcmp(fmt,"nv12")?VA_RT_FORMAT_YUV420:VA_RT_FORMAT_YUV420_10;
+    unsigned rt=bgra?VA_RT_FORMAT_RGB32:!strcmp(fmt,"nv12")?VA_RT_FORMAT_YUV420:!strcmp(fmt,"444p")?VA_RT_FORMAT_YUV444:!strcmp(fmt,"q416")?VA_RT_FORMAT_YUV444_10:VA_RT_FORMAT_YUV420_10;
     VASurfaceID s;CHECK(vaCreateSurfaces(d,rt,w,h,&s,1,at,2));return s;
 }
 static long rss_kb(void){FILE*f=fopen("/proc/self/statm","r");long a,b;fscanf(f,"%ld %ld",&a,&b);fclose(f);return b*4;}
@@ -116,13 +125,14 @@ static int fds(void){char c[64];int n=0;snprintf(c,64,"/proc/self/fd");FILE*p=0;
 int main(int argc,char **argv){
     if(argc<9)return 2;
     int fd=open(argv[1],O_RDWR);hevc=!strcmp(argv[2],"hevc");fmt=argv[3];const char *src=argv[4];w=atoi(argv[5]);h=atoi(argv[6]);int frames=atoi(argv[7]);int cycles=argc>9?atoi(argv[9]):0;
-    int bgra=!strcmp(fmt,"bgra"),ten=!strcmp(fmt,"p010"),put=!strcmp(src,"put");
+    int bgra=!strcmp(fmt,"bgra"),ten=bpp()==2,c444=full(),put=!strcmp(src,"put");
+    unsigned fourcc=c444?(ten?VA_FOURCC_Q416:VA_FOURCC_444P):(ten?VA_FOURCC_P010:VA_FOURCC_NV12);
     VADisplay d=vaGetDisplayDRM(fd);int major,minor;CHECK(vaInitialize(d,&major,&minor));
-    VAProfile profile=hevc?(ten?VAProfileHEVCMain10:VAProfileHEVCMain):VAProfileH264High;
-    unsigned rt=ten?VA_RT_FORMAT_YUV420_10:VA_RT_FORMAT_YUV420;
+    VAProfile profile=hevc?(c444?(ten?VAProfileHEVCMain444_10:VAProfileHEVCMain444):ten?VAProfileHEVCMain10:VAProfileHEVCMain):VAProfileH264High;
+    unsigned rt=c444?(ten?VA_RT_FORMAT_YUV444_10:VA_RT_FORMAT_YUV444):ten?VA_RT_FORMAT_YUV420_10:VA_RT_FORMAT_YUV420;
     VAConfigAttrib attrs[2]={{VAConfigAttribRTFormat,rt},{VAConfigAttribRateControl,VA_RC_CQP}};
     VAConfigID config;CHECK(vaCreateConfig(d,profile,VAEntrypointEncSlice,attrs,2,&config));
-    VASurfaceAttrib sa={.type=VASurfaceAttribPixelFormat,.flags=VA_SURFACE_ATTRIB_SETTABLE,.value={.type=VAGenericValueTypeInteger,.value.i=ten?VA_FOURCC_P010:VA_FOURCC_NV12}};
+    VASurfaceAttrib sa={.type=VASurfaceAttribPixelFormat,.flags=VA_SURFACE_ATTRIB_SETTABLE,.value={.type=VAGenericValueTypeInteger,.value.i=fourcc}};
     VASurfaceID base;CHECK(vaCreateSurfaces(d,rt,w,h,&base,1,&sa,1));
     VAContextID ctx;CHECK(vaCreateContext(d,config,w,h,VA_PROGRESSIVE,&base,1,&ctx));
     Vk vk={0};if(!put){vk_init();vk_make(&vk,!strcmp(src,"linear"));fprintf(stderr,"vk image: modifier %016llx planes %d pitch %d/%d off %d/%d size %llu\n",(unsigned long long)vk.mod,vk.np,vk.pitch[0],vk.pitch[1],vk.off[0],vk.off[1],(unsigned long long)vk.size);}
@@ -138,15 +148,15 @@ int main(int argc,char **argv){
         printf("cycles=%d rss_kb %ld -> %ld fds %d -> %d\n",cycles,r0,rss_kb(),f0,fds());return 0;
     }
     VAImageFormat *formats=calloc(vaMaxNumImageFormats(d),sizeof(*formats));int nf=0;CHECK(vaQueryImageFormats(d,formats,&nf));
-    VAImageFormat format={0};for(int i=0;i<nf;i++)if(formats[i].fourcc==(ten?VA_FOURCC_P010:VA_FOURCC_NV12))format=formats[i];free(formats);
+    VAImageFormat format={0};for(int i=0;i<nf;i++)if(formats[i].fourcc==fourcc)format=formats[i];free(formats);
     VAImage image={0};if(put)CHECK(vaCreateImage(d,&format,w,h,&image));
     VABufferID coded;CHECK(vaCreateBuffer(d,ctx,VAEncCodedBufferType,w*h*8,1,NULL,&coded));
     VABufferID seq,rc,fr;
     if(hevc){
-        VAEncSequenceParameterBufferHEVC s={0};s.general_profile_idc=ten?2:1;s.general_level_idc=153;s.intra_period=60;s.intra_idr_period=60;s.ip_period=1;s.bits_per_second=bits;s.pic_width_in_luma_samples=w;s.pic_height_in_luma_samples=h;s.seq_fields.bits.chroma_format_idc=1;s.seq_fields.bits.bit_depth_luma_minus8=ten?2:0;s.seq_fields.bits.bit_depth_chroma_minus8=ten?2:0;s.log2_min_luma_coding_block_size_minus3=0;s.log2_diff_max_min_luma_coding_block_size=3;s.log2_diff_max_min_transform_block_size=3;
+        VAEncSequenceParameterBufferHEVC s={0};s.general_profile_idc=c444?4:ten?2:1;s.general_level_idc=153;s.intra_period=60;s.intra_idr_period=60;s.ip_period=1;s.bits_per_second=bits;s.pic_width_in_luma_samples=w;s.pic_height_in_luma_samples=h;s.seq_fields.bits.chroma_format_idc=c444?3:1;s.seq_fields.bits.bit_depth_luma_minus8=ten?2:0;s.seq_fields.bits.bit_depth_chroma_minus8=ten?2:0;s.log2_min_luma_coding_block_size_minus3=c444;s.log2_diff_max_min_luma_coding_block_size=c444?1:3;s.log2_diff_max_min_transform_block_size=3;
         CHECK(vaCreateBuffer(d,ctx,VAEncSequenceParameterBufferType,sizeof(s),1,&s,&seq));
     }else{
-        VAEncSequenceParameterBufferH264 s={0};s.level_idc=51;s.intra_period=60;s.intra_idr_period=60;s.ip_period=1;s.bits_per_second=bits;s.max_num_ref_frames=1;s.picture_width_in_mbs=(w+15)/16;s.picture_height_in_mbs=(h+15)/16;s.seq_fields.bits.chroma_format_idc=1;s.seq_fields.bits.frame_mbs_only_flag=1;s.frame_cropping_flag=1;s.frame_crop_right_offset=(((w+15)/16)*16-w)/2;s.frame_crop_bottom_offset=(((h+15)/16)*16-h)/2;
+        VAEncSequenceParameterBufferH264 s={0};s.level_idc=51;s.intra_period=60;s.intra_idr_period=60;s.ip_period=1;s.bits_per_second=bits;s.max_num_ref_frames=1;s.picture_width_in_mbs=(w+15)/16;s.picture_height_in_mbs=(h+15)/16;s.seq_fields.bits.chroma_format_idc=c444?3:1;s.seq_fields.bits.frame_mbs_only_flag=1;s.frame_cropping_flag=1;s.frame_crop_right_offset=(((w+15)/16)*16-w)/(c444?1:2);s.frame_crop_bottom_offset=(((h+15)/16)*16-h)/(c444?1:2);
         CHECK(vaCreateBuffer(d,ctx,VAEncSequenceParameterBufferType,sizeof(s),1,&s,&seq));
     }
     _Alignas(VAEncMiscParameterRateControl) unsigned char rate[sizeof(VAEncMiscParameterBuffer)+sizeof(VAEncMiscParameterRateControl)]={0};
@@ -164,9 +174,10 @@ int main(int argc,char **argv){
         VASurfaceID surface=base;
         if(put){
             VAImage im=image;void *map;CHECK(vaMapBuffer(d,im.buf,&map));
-            unsigned char *yb=malloc(ysz),*uvb=malloc(ysz/2);pattern(yb,uvb,0,n);
+            unsigned char *yb=malloc(ysz),*uvb=malloc(ysz*2);pattern(yb,uvb,0,n);
             for(int y=0;y<h;y++)memcpy((char*)map+im.offsets[0]+y*im.pitches[0],yb+(size_t)y*w*b,w*b);
-            for(int y=0;y<h/2;y++)memcpy((char*)map+im.offsets[1]+y*im.pitches[1],uvb+(size_t)y*w*b,w*b);
+            if(c444)for(int p=1;p<3;p++)for(int y=0;y<h;y++)memcpy((char*)map+im.offsets[p]+y*im.pitches[p],uvb+(p-1)*ysz+(size_t)y*w*b,w*b);
+            else for(int y=0;y<h/2;y++)memcpy((char*)map+im.offsets[1]+y*im.pitches[1],uvb+(size_t)y*w*b,w*b);
             free(yb);free(uvb);
             CHECK(vaUnmapBuffer(d,im.buf));CHECK(vaPutImage(d,base,im.image_id,0,0,w,h,0,0,w,h));
         }else{
@@ -177,7 +188,7 @@ int main(int argc,char **argv){
         if(hevc){
             VAEncPictureParameterBufferHEVC p={0};p.coded_buf=coded;p.pic_init_qp=26;p.pic_fields.bits.idr_pic_flag=n==0||n==45||n==105;p.pic_fields.bits.coding_type=p.pic_fields.bits.idr_pic_flag?1:2;p.pic_fields.bits.reference_pic_flag=1;
             CHECK(vaCreateBuffer(d,ctx,VAEncPictureParameterBufferType,sizeof(p),1,&p,&pic));
-            VAEncSliceParameterBufferHEVC s={0};s.num_ctu_in_slice=((w+63)/64)*((h+63)/64);s.slice_type=p.pic_fields.bits.idr_pic_flag?2:1;
+            VAEncSliceParameterBufferHEVC s={0};s.num_ctu_in_slice=c444?((w+31)/32)*((h+31)/32):((w+63)/64)*((h+63)/64);s.slice_type=p.pic_fields.bits.idr_pic_flag?2:1;
             CHECK(vaCreateBuffer(d,ctx,VAEncSliceParameterBufferType,sizeof(s),1,&s,&slice));
         }else{
             VAEncPictureParameterBufferH264 p={0};p.coded_buf=coded;p.pic_init_qp=26;p.frame_num=n%60;p.pic_fields.bits.idr_pic_flag=n==0||n==45||n==105;p.pic_fields.bits.reference_pic_flag=1;

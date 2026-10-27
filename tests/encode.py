@@ -356,7 +356,7 @@ def zero_copy(args, env, directory):
             if encode(codec, fmt, source, w, h) != encode(codec, fmt, 'put', w, h):
                 raise RuntimeError('bitstream differs from vaPutImage upload')
         return fn
-    for codec, fmt in [('h264', 'nv12'), ('hevc', 'nv12'), ('hevc', 'p010')]:
+    for codec, fmt in [('h264', 'nv12'), ('hevc', 'nv12'), ('hevc', 'p010'), ('h264', '444p'), ('hevc', '444p'), ('hevc', 'q416')]:
         for source in ['linear', 'bl']:
             for w, h in [(1280, 720), (656, 368)]:
                 check(f'import-{codec}-{fmt}-{source}-{w}x{h}', same_as_put(codec, fmt, source, w, h))
@@ -390,31 +390,35 @@ def zero_copy(args, env, directory):
             raise RuntimeError('export -> DRM_PRIME_2 import differs from direct transcode')
     check('export-reimport-bytes', export_reimport)
 
-    def decode_surface_10bit(encoder, options, size):
-        """A 10-bit decode surface straight into the encoder (copy engine) against the same decode uploaded as p010."""
+    def decode_surface(encoder, options, size, pix_fmt):
+        """A decode surface straight into the encoder (copy engine) against the same decode uploaded with hwupload."""
         def fn():
             w, h = size
-            clip = directory / f'zc-10bit-{w}x{h}.mkv'
+            clip = directory / f'zc-{pix_fmt}-{w}x{h}.mkv'
             if not clip.exists():
                 run(['ffmpeg', '-v', 'error', '-f', 'lavfi', '-i', f'testsrc2=size={w}x{h}:rate=30', '-frames:v', '45',
-                     '-pix_fmt', 'yuv420p10le', '-c:v', 'libx265', '-x265-params', 'bframes=3:keyint=30:log-level=error', '-y', str(clip)])
+                     '-pix_fmt', pix_fmt, '-c:v', 'libx265', '-x265-params', 'bframes=3:keyint=30:log-level=error', '-y', str(clip)])
+            upload = {'yuv420p10le': 'p010le'}.get(pix_fmt, pix_fmt)
             outs = []
             for mode in ('surface', 'upload'):
-                out = directory / f'zc-10bit-{encoder}-{w}x{h}-{mode}.bin'
+                out = directory / f'zc-{pix_fmt}-{encoder}-{w}x{h}-{mode}.bin'
                 head = ['ffmpeg', '-v', 'error', '-y']
                 if mode == 'surface':
                     head += ['-hwaccel', 'vaapi', '-hwaccel_device', node, '-hwaccel_output_format', 'vaapi', '-i', str(clip), '-vf', 'null']
                 else:
-                    head += ['-vaapi_device', node, '-i', str(clip), '-vf', 'format=p010le,hwupload']
+                    head += ['-vaapi_device', node, '-i', str(clip), '-vf', f'format={upload},hwupload']
                 run(head + ['-frames:v', '45', '-c:v', encoder, *options, '-g', '30', '-bf', '0', '-f', 'rawvideo', str(out)], env)
                 outs.append(out.read_bytes())
             if not outs[0] or outs[0] != outs[1]:
-                raise RuntimeError('decode-surface encode differs from p010 upload')
+                raise RuntimeError(f'decode-surface encode differs from {upload} upload')
             return dict(bytes=len(outs[0]))
         return fn
-    for encoder, options in [('hevc_vaapi', ['-profile:v', 'main10', '-qp', '28']), ('av1_vaapi', ['-qp', '100'])]:
+    # FFmpeg's VA-API decoder has no pixel format for Q416 (10-bit 4:4:4 decode already fails at vaBeginPicture),
+    # so that decode surface's layout is covered by the Q416 imports above.
+    for encoder, options, pix_fmt in [('hevc_vaapi', ['-profile:v', 'main10', '-qp', '28'], 'yuv420p10le'), ('av1_vaapi', ['-qp', '100'], 'yuv420p10le'),
+                                      ('hevc_vaapi', ['-profile:v', 'rext', '-qp', '28'], 'yuv444p')]:
         for size in [(1280, 720), (656, 368)]:
-            check(f'decode-surface-10bit-{encoder}-{size[0]}x{size[1]}', decode_surface_10bit(encoder, options, size))
+            check(f'decode-surface-{pix_fmt}-{encoder}-{size[0]}x{size[1]}', decode_surface(encoder, options, size, pix_fmt))
 
     def cycles(codec, fmt, src):
         def fn():

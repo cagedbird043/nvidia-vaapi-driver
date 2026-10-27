@@ -103,7 +103,7 @@ GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264d
 - 不支持 VideoProc（`vaCreateConfig(VAProfileNone, VAEntrypointVideoProc)` 返回 `UNSUPPORTED_PROFILE`），`scale_vaapi` 等 VPP 滤镜不可用；C 版的 VideoProc 同样只有最小实现。
 - Chrome 需要 `--disable-gpu-sandbox` 与 `--render-node-override`：默认沙箱下 Chrome 重新打开 VA display 被其 broker 拒绝，驱动无法绕过。
 - 4:2:2 解码、VP9 / AV1 4:4:4、AV1 12-bit、H.264 隔行与 FMO 等 NVDEC 不支持的情形会返回错误。
-- BGRA 输入的色彩转换在 CPU；4:4:4 解码 surface 不能直接作编码输入。
+- BGRA 输入的色彩转换在 CPU。
 - 视频帧同步在 CPU 侧完成，编码提交为同步。
 
 完整列表见 [docs/design.md](docs/design.md)。
@@ -218,7 +218,7 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 - No VideoProc: `scale_vaapi` and other VPP filters are unavailable.
 - Chrome needs `--disable-gpu-sandbox` and `--render-node-override`.
 - Formats NVDEC cannot decode (4:2:2, VP9 / AV1 4:4:4, AV1 12-bit, interlaced H.264, FMO, …) return errors.
-- BGRA colour conversion for encoder input runs on the CPU; 4:4:4 decoded surfaces cannot be used directly as encoder input.
+- BGRA colour conversion for encoder input runs on the CPU.
 - Frame synchronisation is CPU-side and encode submission is synchronous.
 
 ## Performance vs. the C driver
