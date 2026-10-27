@@ -273,7 +273,7 @@ GStreamer `vapostproc`（两级：VA surface 上处理，再读回）对照 zsca
 
 RM 的实机测试 `cargo test --release --lib vpp -- --ignored` 覆盖每种格式的 copy engine 拷贝、内核与 CPU 参考（32 种组合 × 5 种几何，误差 ≤ 1）和单位变换逐字节一致。
 
-Chrome 156（Linux）只在 native 输入（GpuMemoryBuffer）且 `source_rect != encode_size` 时调用 `BlitSurface()`。实测未能触发：WebCodecs 在 Linux 上 `IsGpuFrameResizeSupported()` 为 false，裁剪 / 缩放在 renderer 里做；WebRTC 加 `--video-capture-use-gpu-memory-buffer`（假摄像头）后 VEA 仍以 I420 + SharedMemory 初始化；空间层 SVC 只支持 VP9，NVENC 没有 VP9 编码。
+Chrome 156（Linux）只在 native 输入（GpuMemoryBuffer）且 `source_rect != encode_size` 时调用 `BlitSurface()`。实测未能触发：WebCodecs 在 Linux 上 `IsGpuFrameResizeSupported()` 为 false，裁剪 / 缩放在 renderer 里做；WebRTC 用真实摄像头（1280×720，`scaleResolutionDownBy: 2`）加 `--video-capture-use-gpu-memory-buffer` 时，H.264 由 VAVEA 硬编、硬解，但浏览器进程判定本机不支持 NV12 GpuMemoryBuffer（`IsGpuMemoryBufferNV12Supported()`），给 renderer 追加 `--disable-video-capture-use-gpu-memory-buffer`，VEA 仍以 I420 + SharedMemory 初始化，这一判定与本驱动无关；屏幕共享在 `IsZeroCopyEnabled()` 里直接排除；空间层 SVC 只支持 VP9，NVENC 没有 VP9 编码。
 
 ## 解码状态的延迟检查
 
