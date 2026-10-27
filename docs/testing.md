@@ -11,7 +11,8 @@
 | `tests/decode.py` | 全部解码格式的逐帧比较（`--codec av1` 单个格式；`--c-driver` 同时跑 C 版；`--fetch-samples` 下载 VC-1 样片） |
 | `tests/encode.py` | 编码回归、属性对照、零拷贝输入、稳定性（`--quick --skip-stability` 快速） |
 | `tests/env.py` | 环境变量与兼容行为 |
-| `tests/gstreamer.py` | GStreamer `va` 元素解码六种格式、编码三种格式（需要 `GST_VA_ALL_DRIVERS=1`，脚本已设置） |
+| `tests/gstreamer.py` | GStreamer `va` 元素解码六种格式、编码三种格式、`vapostproc` 缩放与变格式（需要 `GST_VA_ALL_DRIVERS=1`，脚本已设置） |
+| `tests/vpp.py` | VideoProc：直接 VA 客户端 `tests/vpp_probe.c` 的像素级单项与 ffmpeg `scale_vaapi` 对照（`--only probe` / `--only ffmpeg`） |
 
 `cargo test --release` 只跑无需 GPU 的单元测试。
 
@@ -238,6 +239,39 @@ BGRA 外部 dma-buf 编码（H.264，300 帧，同一帧只上传一次，`IMP_S
 | 硬件编码 720p 30 帧经软件解码与源画面 PSNR | 平均 28.10 dB、最低 27.96 dB | 平均 28.10 dB、最低 27.96 dB |
 
 Chrome 经 DRM_PRIME_2 导入 NV12（C 版下的 libva trace：两个 object 指向同一缓冲、修饰符 0 即线性、pitch 1280、UV 偏移 983040），由 copy engine 送入 NVENC，不经 CPU。软件编码同一画面 PSNR 约 36.9 dB；两驱动硬件结果完全相同，差距来自 Chrome 的 RGB→NV12 输入与码率，不在驱动。
+
+## 视频处理
+
+```sh
+python3 tests/vpp.py
+python3 tests/gstreamer.py --only postproc
+```
+
+`tests/vpp.py` 的 probe 部分编译 `tests/vpp_probe.c`，逐项与测试内的 H.273 公式参考比较（纯色画面误差 ≤ 1）：
+
+- 12 种格式各两种尺寸（含 70×38 奇数行宽）的同格式拷贝逐字节一致；
+- NV12 / P010 / Q416 → BGRA，BT.601 / 709 / 2020 × full / limited；
+- 颜色解析：固定标准忽略填了垃圾值的 Explicit 字段；Explicit 只换矩阵与 range；一端未指定按继承；两端未指定按高度（480 / 720 行）选矩阵；RGB → YUV 按输出高度（718 / 720 行）选矩阵；BT.601 → BT.709 只换矩阵；
+- 拒绝：滤镜参数缓冲、`num_filters` 非零返回 `VA_STATUS_ERROR_UNSUPPORTED_FILTER`，BT.709 → BT.2020、PQ → SDR 返回 `VA_STATUS_ERROR_UNIMPLEMENTED`；
+- 色度左对齐 / 居中，`output_region` 外的背景（RGBA 透明、NV12 不透明白）。
+
+ffmpeg 部分（`setparams=chroma_location=center`，与 swscale 的假设一致）：
+
+| 用例 | 结果 |
+|---|---|
+| 1080p → 1440p、NV12 → BGRA、NV12 → P010 | 与 swscale bilinear 逐字节一致 |
+| 1080p → 720p（Y） | PSNR ≈ 46 dB |
+| 1080p → 360p、4K → 1080p | 33.8 / 45.9 dB（缩小较多时 swscale 的滤波器覆盖更宽） |
+| HEVC 10-bit P010 → 720p NV12、HEVC 4:4:4 → NV12 | 45.3 / 49.4 dB |
+| CPU 上传 NV12 → 360p、BGRA → NV12 | 33.8 / 49.1 dB |
+| 1080p → RGBA 720p | 45.3 dB |
+| `scale_vaapi` 后接 `h264_vaapi` | 通过 |
+
+GStreamer `vapostproc`（两级：VA surface 上处理，再读回）对照 zscale bilinear（GStreamer 按高度协商 BT.601 / 709，NV12 色度左对齐，swscale 不支持左对齐）：720p → 360p 37.0 dB，720p → 1080p 63.0 dB，NV12 → BGRA 103.3 dB，硬解 H.264 → 540p 38.6 dB。libva-utils `vavpp` 640×480 → 320×240 通过。
+
+RM 的实机测试 `cargo test --release --lib vpp -- --ignored` 覆盖每种格式的 copy engine 拷贝、内核与 CPU 参考（32 种组合 × 5 种几何，误差 ≤ 1）和单位变换逐字节一致。
+
+Chrome 156（Linux）只在 native 输入（GpuMemoryBuffer）且 `source_rect != encode_size` 时调用 `BlitSurface()`。实测未能触发：WebCodecs 在 Linux 上 `IsGpuFrameResizeSupported()` 为 false，裁剪 / 缩放在 renderer 里做；WebRTC 加 `--video-capture-use-gpu-memory-buffer`（假摄像头）后 VEA 仍以 I420 + SharedMemory 初始化；空间层 SVC 只支持 VP9，NVENC 没有 VP9 编码。
 
 ## 环境变量与其余回归
 

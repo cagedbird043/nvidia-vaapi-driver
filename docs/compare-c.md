@@ -8,13 +8,13 @@
 
 | 槽 | C 版 | rustnv |
 |---|---|---|
-| Terminate、QueryConfigProfiles/Entrypoints/Attributes、CreateConfig/DestroyConfig、GetConfigAttributes | 实现 | 实现；profile 列表无 JPEG（不支持）和 `VAProfileNone`（C 版把它列了两次且 `vaQueryConfigEntrypoints` 对它返回 UNSUPPORTED_PROFILE，GStreamer `va` 插件因此注册不出任何元素） |
+| Terminate、QueryConfigProfiles/Entrypoints/Attributes、CreateConfig/DestroyConfig、GetConfigAttributes | 实现 | 实现；profile 列表无 JPEG（不支持）；`VAProfileNone` 只列一次，入口为 `VAEntrypointVideoProc`（C 版把它列了两次且 `vaQueryConfigEntrypoints` 对它返回 UNSUPPORTED_PROFILE，GStreamer `va` 插件因此注册不出任何元素） |
 | CreateSurfaces/2、DestroySurfaces、CreateContext/DestroyContext、CreateBuffer、BufferSetNumElements、MapBuffer/UnmapBuffer/DestroyBuffer、BufferInfo、Begin/Render/EndPicture、QuerySurfaceAttributes、ExportSurfaceHandle | 实现 | 实现 |
 | SyncSurface | 实现 | 实现 |
 | SyncSurface2、SyncBuffer、MapBuffer2 | 不在 vtable（libva 返回 UNIMPLEMENTED） | 实现；`vaSyncSurface2` 的超时：0 只查询，`UINT64_MAX` 一直等，到期仍在运行返回 `VA_STATUS_ERROR_TIMEDOUT` |
 | QuerySurfaceStatus | UNIMPLEMENTED | 实现（Rendering / Ready） |
 | QuerySurfaceError | UNIMPLEMENTED | UNIMPLEMENTED |
-| QueryImageFormats / CreateImage | NV12、NV16、P010、P210、P012、P016、ARGB、444P、Q416 | NV12、P010、P012、P016、444P、Q416。NV16、P210 只对 4:2:2 surface 有意义，本 GPU 的 NVDEC 没有 4:2:2 解码；ARGB 只服务 C 版的 RGB32 VideoProc 目标，rustnv 没有 RGB32 surface |
+| QueryImageFormats / CreateImage | NV12、NV16、P010、P210、P012、P016、ARGB、444P、Q416 | NV12、P010、P012、P016、444P、Q416、BGRA、BGRX、ARGB、XRGB、RGBA、RGBX。NV16、P210 只对 4:2:2 surface 有意义，本 GPU 的 NVDEC 没有 4:2:2 解码 |
 | DeriveImage | 恒返回 `OPERATION_FAILED` | 实现（解码 surface 读回；编码输入 surface 直接映射） |
 | GetImage | 实现（忽略 x、y，从原点拷贝；surface 没有 context 时返回 INVALID_CONTEXT） | 实现，检查区域，必须与图像同尺寸；surface 与图像格式需一致（P010/P012 可读入 P016 图像） |
 | PutImage | 仅同尺寸、同格式，缩放返回 UNIMPLEMENTED | 仅整幅 surface（用作编码输入），否则 INVALID_PARAMETER |
@@ -23,9 +23,9 @@
 | CreateSubpicture 等其余 subpicture 槽 | UNIMPLEMENTED | UNIMPLEMENTED |
 | QueryDisplayAttributes | 0 个，成功 | 同；Get/SetDisplayAttributes 为 UNIMPLEMENTED，两者一致 |
 | vaCopy | 不在 vtable | UNIMPLEMENTED |
-| `vtable_vpp`（QueryVideoProcFilters / FilterCaps / PipelineCaps） | 实现，仅对 `VAProfileNone` + `VAEntrypointVideoProc` 的 context：无滤镜，`VA_STATUS_ERROR_UNSUPPORTED_FILTER` | 未提供，见下 |
+| `vtable_vpp`（QueryVideoProcFilters / FilterCaps / PipelineCaps） | 实现，仅对 `VAProfileNone` + `VAEntrypointVideoProc` 的 context：无滤镜，`VA_STATUS_ERROR_UNSUPPORTED_FILTER` | 实现：无滤镜，滤镜参数返回 `VA_STATUS_ERROR_UNSUPPORTED_FILTER`；PipelineCaps 报告 12 种输入 / 输出格式、颜色标准与 chroma siting，不报旋转、镜像、混合 |
 
-C 版的 VideoProc 是最小实现：只做同尺寸、原点为 0 的同格式拷贝，以及 NV12/P010/P012 到 ARGB 的色彩转换（CUDA 内核）。缩放、变格式、滤镜都失败（`ffmpeg -vf scale_vaapi=w=640:h=360` 报 “Failed to render parameter buffer”，`format=p010` 同样）；ffmpeg 对 `scale_vaapi=format=nv12` 这类无变化的请求直接旁路，不经过它。因此 rustnv 不提供 VideoProc：`vaCreateConfig(VAProfileNone, VAEntrypointVideoProc)` 返回 `UNSUPPORTED_PROFILE`，应用侧得到的结论与 C 版对任何实际视频处理请求一致。
+C 版的 VideoProc 是最小实现：只做同尺寸、原点为 0 的同格式拷贝，以及 NV12/P010/P012 到 ARGB 的色彩转换（CUDA 内核）。缩放、变格式、滤镜都失败（`ffmpeg -vf scale_vaapi=w=640:h=360` 报 “Failed to render parameter buffer”，`format=p010` 同样）。rustnv 覆盖这两项，并加上双线性缩放、裁剪、目的区域与背景色、NV12 / P010 / P012 / P016 / 444P / Q416 / RGB32 之间互转与 BT.601 / 709 / 2020 矩阵转换（copy engine + compute 内核，不用 CUDA），见 [design.md](design.md#视频处理)。
 
 `VADriverContext` 字段：
 
@@ -67,15 +67,16 @@ C 版读取的变量，与 rustnv 的处理：
 | ffmpeg | 解码 MPEG-4 part 2 | ffmpeg 静默回落软解（CPU 约 4 s / 3000 帧） | 硬解 |
 | ffmpeg | 编码 `h264_vaapi` / `hevc_vaapi` / `av1_vaapi`，CQP 与 CBR，1080p / 4K，含硬解到硬编的转码 | 通过 | 通过 |
 | ffmpeg | 8192×4320 解码 HEVC / VP9 / AV1 | 通过（逐字节等于软解） | 通过 |
-| ffmpeg | `scale_vaapi` 缩放 / 变格式 | 失败（Failed to render parameter buffer） | 失败（不支持 VideoProc） |
+| ffmpeg | `scale_vaapi` 缩放 / 变格式 | 失败（Failed to render parameter buffer） | 通过；`tests/vpp.py`：放大与同尺寸变格式与 swscale bilinear 逐字节一致，1080p → 720p PSNR ≈ 46 dB |
 | mpv `--hwdec=vaapi-copy` 与 `vaapi --vo=gpu` | H.264 / HEVC / HEVC10 / VP9 / AV1 / VP8 / MPEG-2 / HEVC 4K | “Using hardware decoding” | 相同 |
-| GStreamer 1.28 `va` 插件（`GST_VA_ALL_DRIVERS=1`） | 注册元素 | 0 个（上述 `VAProfileNone` 问题） | vah264dec / vah265dec / vavp9dec / vavp8dec / vaav1dec / vampeg2dec / vah264enc / vah265enc / vaav1enc；无 vapostproc、vacompositor、vadeinterlace |
-| GStreamer | `gst-launch-1.0` 解码六种格式、编码三种格式 | 无元素，不可用 | `tests/gstreamer.py`：解码与软解逐帧一致（MPEG-2 PSNR 68.7 dB），编码输出软解后帧数与 PSNR 合格 |
+| GStreamer 1.28 `va` 插件（`GST_VA_ALL_DRIVERS=1`） | 注册元素 | 0 个（上述 `VAProfileNone` 问题） | vah264dec / vah265dec / vavp9dec / vavp8dec / vaav1dec / vampeg2dec / vah264enc / vah265enc / vaav1enc / vapostproc；无 vacompositor、vadeinterlace |
+| GStreamer | `gst-launch-1.0` 解码六种格式、编码三种格式、`vapostproc` 缩放与变格式 | 无元素，不可用 | `tests/gstreamer.py`：解码与软解逐帧一致（MPEG-2 PSNR 68.7 dB），编码输出软解后帧数与 PSNR 合格；`vapostproc` 输出与 zscale 参考比较（NV12 → BGRA 103 dB） |
 | Firefox（`media.ffmpeg.vaapi.enabled`，临时 profile） | H.264 / HEVC / VP9 / AV1 / VP8 `<video>` 播放 | “VA-API FFmpeg init successful”，逐帧 VA-API 解码（测试时设了 `MOZ_DISABLE_RDD_SANDBOX=1`） | 同样成功，未设该变量 |
 | Chrome 156（`--disable-gpu-sandbox`，临时 profile） | 同五种格式播放；WebCodecs H.264 Baseline / High `prefer-hardware` 编码 60 帧 | 通过，码流 300229 B | 通过，码流 301622 B（Baseline）；HEVC / VP9 / AV1 编码 Chrome 不提供 |
 | libva-utils `avcenc` / `h264encode` / `hevcencode` | 无窗口系统（`env -u WAYLAND_DISPLAY -u DISPLAY`）的 drm 显示 | 输出 0 字节（初始化失败） | 正常输出码流 |
 | libva-utils `vp8enc` / `mpeg2vaenc` / `vp9enc` | 编码 | 无此入口 | 无此入口 |
-| libva-utils `vavpp`、`vacopy`、`jpegenc`、`loadjpeg`、`putsurface` | VideoProc / JPEG / vaPutSurface | VideoProc 仅最小实现；JPEG 走 CUDA；PutSurface 未实现 | 同样不可用（不支持 VideoProc、JPEG、PutSurface） |
+| libva-utils `vavpp` | VideoProc（`FILTER_TYPE: VAProcFilterNone`，640×480 → 320×240） | 未测 | 通过 |
+| libva-utils `vacopy`、`jpegenc`、`loadjpeg`、`putsurface` | vaCopy / JPEG / vaPutSurface | vaCopy 不在 vtable；JPEG 走 CUDA；PutSurface 未实现 | 不可用（vaCopy、JPEG、PutSurface 未实现） |
 
 GStreamer 在 AV1 关键帧上把 `ref_frame_idx` 填 255；驱动对关键帧不校验也不使用该字段。
 

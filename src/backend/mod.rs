@@ -120,13 +120,16 @@ impl Export {
 
 /// Plane geometry of the block-linear backing for a `format` surface of `width` x `height`:
 /// (pitch, plane offsets, size). Luma first; 4:2:0 formats continue with one CbCr plane, 4:4:4
-/// formats with separate Cb and Cr planes. Planes start at multiples of 64 rows.
+/// formats with separate Cb and Cr planes; RGB has its one plane. Planes start at multiples of
+/// 64 rows.
 fn backing_layout(width: u32, height: u32, format: Format) -> (u32, [u32; 3], usize) {
     let layout = SurfaceLayout::new(width, height, format.bytes_per_sample());
     let plane = layout.chroma_offset as u32;
     let offsets = [0, plane, if format.chroma_444 { 2 * plane } else { 0 }];
     let size = if format.chroma_444 {
         3 * plane as usize
+    } else if format.rgb() {
+        plane as usize
     } else {
         layout.size
     };

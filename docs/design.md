@@ -26,7 +26,7 @@ RM 按 NVIDIA 驱动版本精确匹配 ABI，不认识的版本拒绝运行。Tu
 
 解码明确拒绝并返回错误的情况：4:2:2、VP9/AV1 4:4:4、AV1 12-bit、H.264 隔行/场编码、H.264 FMO、HEVC PCM 与分离色彩平面、
 MPEG-4 的 sprite（GMC）、H.263 短头、data partitioning 与 reversible VLC（NVDEC 的 MPEG-4 描述符没有这些字段，stock 解 data partitioning 的结果也是错的）、
-VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 与帧间 superres。不支持视频后处理。
+VP9 在分段图写入后改变编码尺寸、AV1 film grain、large-scale tile 与帧间 superres。
 
 VP9 Profile 2、AV1 的 surface 位深由 `vaCreateSurfaces` 的 RTFormat 决定，context 在第一帧按目标 surface 重建解码器。Chrome 建 AV1 / VP9 Profile 2 的 config 时 RTFormat 只给 YUV420，随后才创建 10-bit surface；驱动与 C 版一样把 RTFormat 当提示，按 surface 格式解码。
 
@@ -64,6 +64,20 @@ C 版的 JPEG Baseline 经 libnvcuvid 的 JPEG 路径解码；nvrm 追踪显示 
 
 FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由回归脚本里的直接 VA 客户端测试，并检查输出色度/位深。
 
+## 视频处理
+
+`VAProfileNone` + `VAEntrypointVideoProc`，由 `src/vpp.rs` 的 worker 线程（`rustnv-vpp`）持有 RM 的 `video::vpp::Processor`。只在 compute 内核实测过的 GPU（Ada，compute class `0xc9c0`）上报告该入口。
+
+- 格式：NV12、P010、P012、P016、444P、Q416 与 RGB32（BGRA / BGRX / ARGB / XRGB / RGBA / RGBX）之间任意组合；RGB32 surface 可直接创建，也可作 `vaGetImage` / `vaDeriveImage` 的来源。
+- 管线：copy engine 把源平面（块线性或线性）拷进显存线性 scratch，compute 内核 `vpp` 做双线性缩放、`surface_region` 裁剪、色彩矩阵与位深转换，`output_region` 以外按 `output_background_color` 填充（RGB 输出带 alpha），再由 copy engine 写回目标 surface。同格式、同尺寸、无裁剪的请求只做 copy engine 拷贝，逐字节一致。
+- `VA_FILTER_SCALING_*` 一律按双线性；`vaQueryVideoProcFilters` 返回空集，滤镜参数缓冲与 `num_filters` 非零都返回 `VA_STATUS_ERROR_UNSUPPORTED_FILTER`。不支持旋转、镜像、混合、额外输出与参考帧。
+- 色彩分三步解析：
+  1. 固定标准按 libva 隐含的 primaries / transfer / matrix，`VAProcColorStandardExplicit` 才读 `VAProcColorProperties` 的三个字段。
+  2. 未指定的矩阵：RGB 侧为 identity；YUV 输出继承 YUV 输入的矩阵，输入为 RGB 时按输出高度选 BT.709（≥ 720 行）或 BT.601；YUV 输入按输入高度选。YUV 侧把 identity 矩阵也当未指定（FFmpeg 从 RGB 元数据复制它）。未指定的 range：YUV 为 limited，RGB 为 full。primaries / transfer 一端未指定则视为与另一端相同。
+  3. 只有矩阵或 range 不同时做转换。BT.709、BT.601（525 / 625）、BT.470M、SMPTE 240M 与 generic film 的原色视为同一色域，相互之间只换矩阵（与其他 VA 驱动和 GStreamer `videoconvert` 一致，GStreamer 按画面高度协商 BT.601 / BT.709）；跨色域（如 BT.2020）或 transfer 不同（如 PQ → SDR）返回 `VA_STATUS_ERROR_UNIMPLEMENTED`。
+- 色度位置按 `chroma_sample_location`：水平左对齐或居中，垂直顶、中、底。
+- 完成状态挂在目标 surface 上：编码、导出、`vaSyncSurface`、读回都会先等它。
+
 ## 零拷贝与 DMA-BUF
 
 | 输入来源 | 到 NVENC 的路径 |
@@ -93,7 +107,7 @@ C 版 nvidia-vaapi-driver 看似能在默认设置下工作，是因为它加载
 
 ## 已知限制
 
-- 不支持 JPEG（见上）和 VideoProc（`VAProfileNone` + `VAEntrypointVideoProc`；缩放、变格式、滤镜均不可用，ffmpeg 的 `scale_vaapi` 因此不能用）。
+- 不支持 JPEG（见上）。VideoProc 没有滤镜，跨色域与 HDR → SDR 不做；Turing / Ampere / Hopper / Blackwell 的 `vpp` 内核随 RM 生成，但未在硬件上运行，这些 GPU 不报告 VideoProc。
 - BGRA 的 GPU 转换只在实测过的 Ada（compute class `0xc9c0`）上启用；其他架构的内核随 RM 生成、QMD 打包有单测，但不在硬件上运行，回退到 CPU 转换。
 - 同步在 CPU 侧：解码完成与 copy engine 完成都由 CPU 等待，未做 GPU 侧 fence 串联。
 - 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。

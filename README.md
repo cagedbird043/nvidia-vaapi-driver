@@ -12,6 +12,7 @@
 | 编码 | H.264（Constrained Baseline / Main / High，含 4:4:4）；HEVC（Main / Main10 / Main444 / Main444_10）；AV1 Profile 0；CQP / CBR / VBR |
 | 导出 | `vaExportSurfaceHandle`（DRM PRIME 2，块线性修饰符），解码画面零 CPU 拷贝 |
 | 导入 | DRM PRIME / PRIME 2 的 dma-buf 作编码输入（NV12 / P010 / P012 / BGRA），经 GPU copy engine 送入 NVENC |
+| 视频处理 | `VAProfileNone` + `VAEntrypointVideoProc`（Ada）：双线性缩放、源裁剪、目的区域与背景色、NV12 / P010 / P012 / P016 / 444P / Q416 / RGB32 之间互转、BT.601 / 709 / 2020 矩阵与 full / limited range；无滤镜 |
 
 解码最大尺寸：H.264 / VP8 4096，MPEG-2 4080，MPEG-4 / VC-1 2048，HEVC / VP9 / AV1 8192。编码最大 8192×8192。各格式细节见 [docs/design.md](docs/design.md)。
 
@@ -77,12 +78,15 @@ ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format
 ffmpeg -init_hw_device vaapi=va:/dev/dri/renderD129 -filter_hw_device va \
   -f lavfi -i testsrc2=size=1920x1080:rate=30 -vf format=nv12,hwupload \
   -frames:v 120 -c:v h264_vaapi -profile:v high -rc_mode CQP -qp 26 out.mkv
+ffmpeg -hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format vaapi -i in.mkv \
+  -vf scale_vaapi=w=1280:h=720:format=nv12 -c:v h264_vaapi out.mkv
 ```
 
-**GStreamer**：`va` 插件默认只注册已知驱动，需要 `GST_VA_ALL_DRIVERS=1`：
+**GStreamer**：`va` 插件默认只注册已知驱动，需要 `GST_VA_ALL_DRIVERS=1`；缩放、变格式用 `vapostproc`：
 
 ```sh
-GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264dec ! fakesink
+GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264dec ! vapostproc ! \
+  'video/x-raw(memory:VAMemory),width=1280,height=720' ! fakesink
 ```
 
 ## 环境变量
@@ -100,7 +104,7 @@ GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264d
 ## 已知限制
 
 - 不支持 JPEG：C 版的 JPEG 走 CUDA 内核，本驱动不用 CUDA。
-- 不支持 VideoProc（`vaCreateConfig(VAProfileNone, VAEntrypointVideoProc)` 返回 `UNSUPPORTED_PROFILE`），`scale_vaapi` 等 VPP 滤镜不可用；C 版的 VideoProc 同样只有最小实现。
+- VideoProc 没有去隔行、降噪、锐化、tone mapping 等滤镜，任何滤镜参数返回 `VA_STATUS_ERROR_UNSUPPORTED_FILTER`；跨色域（如 BT.709 ↔ BT.2020）或 transfer 不同（HDR → SDR）的请求返回错误，不当作矩阵转换。只在实测过的 Ada 上提供。
 - Chrome 需要 `--disable-gpu-sandbox` 与 `--render-node-override`：默认沙箱下 Chrome 重新打开 VA display 被其 broker 拒绝，驱动无法绕过。
 - 4:2:2 解码、VP9 / AV1 4:4:4、AV1 12-bit、H.264 隔行与 FMO 等 NVDEC 不支持的情形会返回错误。
 - BGRA 输入的 GPU 色彩转换只在实测过的 Ada 上启用，其他架构回退到 CPU 转换。
@@ -156,6 +160,7 @@ A VA-API driver for NVIDIA GPUs written in Rust. It talks directly to the open N
 | Encode | H.264 (Constrained Baseline / Main / High incl. 4:4:4); HEVC (Main / Main10 / Main444 / Main444_10); AV1 Profile 0; CQP / CBR / VBR |
 | Export | `vaExportSurfaceHandle` (DRM PRIME 2, block-linear modifiers), no CPU copy for decoded frames |
 | Import | DRM PRIME / PRIME 2 dma-bufs as encoder input (NV12 / P010 / P012 / BGRA), fed to NVENC by the GPU copy engine |
+| Video processing | `VAProfileNone` + `VAEntrypointVideoProc` (Ada): bilinear scaling, source crop, output region and background colour, conversion between NV12 / P010 / P012 / P016 / 444P / Q416 / RGB32, BT.601 / 709 / 2020 matrices, full / limited range; no filters |
 
 Maximum decode size: H.264 / VP8 4096, MPEG-2 4080, MPEG-4 / VC-1 2048, HEVC / VP9 / AV1 8192. Maximum encode size is 8192×8192. Details: [docs/design.md](docs/design.md) (Chinese).
 
@@ -199,8 +204,8 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 - **mpv**: `mpv --hwdec=vaapi --hwdec-software-fallback=no --vo=gpu --gpu-api=opengl video.mp4`. Add `--hwdec-codecs=all` for MPEG-2 / MPEG-4.
 - **Firefox**: set `media.ffmpeg.vaapi.enabled = true` in `about:config` (some versions also need `media.hardware-video-decoding.force-enabled = true`).
 - **Chrome / Chromium**: the GPU sandbox must be disabled and the NVIDIA render node given explicitly; see the command in the Chinese section above.
-- **ffmpeg**: `-hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format vaapi` for decoding; `-init_hw_device vaapi=va:/dev/dri/renderD129 -filter_hw_device va … -vf format=nv12,hwupload -c:v h264_vaapi` for encoding.
-- **GStreamer**: set `GST_VA_ALL_DRIVERS=1` so the `va` plugin registers elements for this driver.
+- **ffmpeg**: `-hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format vaapi` for decoding; `-init_hw_device vaapi=va:/dev/dri/renderD129 -filter_hw_device va … -vf format=nv12,hwupload -c:v h264_vaapi` for encoding; `scale_vaapi` for scaling and format conversion.
+- **GStreamer**: set `GST_VA_ALL_DRIVERS=1` so the `va` plugin registers elements for this driver; `vapostproc` scales and converts.
 
 ## Environment variables
 
@@ -215,7 +220,7 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 ## Known limitations
 
 - No JPEG (the C driver decodes it with CUDA kernels; this driver does not use CUDA).
-- No VideoProc: `scale_vaapi` and other VPP filters are unavailable.
+- VideoProc has no filters (deinterlacing, denoise, sharpening, tone mapping): filter parameters return `VA_STATUS_ERROR_UNSUPPORTED_FILTER`. Requests across gamuts (e.g. BT.709 ↔ BT.2020) or transfers (HDR → SDR) return an error instead of being treated as a matrix change. Offered only on the tested Ada GPU.
 - Chrome needs `--disable-gpu-sandbox` and `--render-node-override`.
 - Formats NVDEC cannot decode (4:2:2, VP9 / AV1 4:4:4, AV1 12-bit, interlaced H.264, FMO, …) return errors.
 - GPU colour conversion of BGRA encoder input is enabled only on the tested Ada GPU; other architectures fall back to the CPU.

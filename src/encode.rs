@@ -463,6 +463,9 @@ impl Session {
 /// CPU-side upload of planes the client wrote through `vaPutImage` or a derived image.
 fn upload(e: &mut Encoder, i: &Input, chroma: &mut Vec<u8>) -> R {
     let y = &i.bytes[i.offsets[0]..];
+    if crate::Format::of_fourcc(i.fourcc).is_none_or(|f| f.rgb()) && i.fourcc != P016 {
+        return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
+    }
     let uv = &i.bytes[i.offsets[1]..];
     gpu(match i.fourcc {
         P010 | P012 | P016 => e.load_p010(y, i.pitch, uv, i.pitch),
@@ -494,6 +497,7 @@ fn ingest(e: &mut Encoder, key: u32, dma: &Dma, ready: &[Arc<Completion>]) -> R 
     let source = dma.source()?;
     gpu(match dma.kind {
         Kind::Bgra => e.load_dmabuf_bgra(u64::from(key), &source),
+        Kind::Rgba => return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus),
         _ => e.load_dmabuf(u64::from(key), &source),
     }
     .map_err(|e| e.to_string()))
@@ -510,7 +514,7 @@ impl Drop for Session {
 
 pub(super) const INPUT_FORMATS: [u32; 4] = [NV12, P010, YUV444P, Q416];
 
-pub(super) unsafe fn query_profiles(list: *mut VAProfile, n: *mut i32) -> R {
+pub(super) unsafe fn query_profiles(list: *mut VAProfile, n: *mut i32, vpp: bool) -> R {
     if list.is_null() {
         return Err(INVALID);
     }
@@ -520,6 +524,9 @@ pub(super) unsafe fn query_profiles(list: *mut VAProfile, n: *mut i32) -> R {
             profiles.push(*profile);
         }
     }
+    if vpp {
+        profiles.push(VAProfileNone);
+    }
     std::ptr::copy_nonoverlapping(profiles.as_ptr(), list, profiles.len());
     out(n, profiles.len() as i32)
 }
@@ -528,8 +535,12 @@ pub(super) unsafe fn query_entrypoints(
     profile: VAProfile,
     list: *mut VAEntrypoint,
     n: *mut i32,
+    vpp: bool,
 ) -> R {
     let mut entries = Vec::new();
+    if vpp {
+        entries.push(VAEntrypointVideoProc);
+    }
     if crate::PROFILES.contains(&profile) {
         entries.push(VAEntrypointVLD);
     }
@@ -728,10 +739,8 @@ pub(super) unsafe fn create_image(
 
 pub(super) fn derive_input_image(d: &mut Driver, surface: u32) -> R<Option<VAImage>> {
     let s = d.surface(surface)?;
-    if s.import.is_some() {
-        return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
-    }
-    if s.decode.is_some() {
+    // Decoded, processed and imported pictures are read back into a copy.
+    if s.import.is_some() || s.decode.is_some() || s.processed.is_some() {
         return Ok(None);
     }
     let (w, h, fourcc) = (s.width, s.height, s.fourcc);
@@ -793,6 +802,7 @@ pub(super) fn put_image(
     input.fourcc = image.format.fourcc;
     input.pitch = image.pitches[0] as usize;
     input.offsets = image.offsets.map(|v| v as usize);
+    s.processed = None;
     Ok(())
 }
 
@@ -802,7 +812,7 @@ pub(super) unsafe fn query_surface_attributes(
     attrs: *mut VASurfaceAttrib,
     n: *mut u32,
 ) -> R {
-    if !d.configs.contains_key(&config) && !d.enc_configs.contains_key(&config) {
+    if !d.configs.contains_key(&config) && !d.enc_configs.contains_key(&config) && !d.vpp_configs.contains(&config) {
         return Err(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus);
     }
     if n.is_null() {
@@ -848,6 +858,17 @@ pub(super) unsafe fn query_surface_attributes(
                 values.push(surface_attr(VASurfaceAttribPixelFormat, fourcc, true));
             }
         }
+    }
+    if d.vpp_configs.contains(&config) {
+        values[3] = surface_attr(VASurfaceAttribMaxWidth, ENC_MAX_DIM, false);
+        values[4] = surface_attr(VASurfaceAttribMaxHeight, ENC_MAX_DIM, false);
+        values[6] = surface_attr(
+            VASurfaceAttribUsageHint,
+            VA_SURFACE_ATTRIB_USAGE_HINT_VPP_READ | VA_SURFACE_ATTRIB_USAGE_HINT_VPP_WRITE,
+            true,
+        );
+        values.retain(|value| value.type_ != VASurfaceAttribPixelFormat);
+        values.extend(crate::vpp::FORMATS.iter().map(|f| surface_attr(VASurfaceAttribPixelFormat, *f, true)));
     }
     if attrs.is_null() {
         return out(n, values.len() as u32);

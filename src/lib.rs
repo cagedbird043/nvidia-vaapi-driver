@@ -1,6 +1,7 @@
 mod backend;
 mod encode;
 mod import;
+mod vpp;
 mod log;
 pub mod va;
 
@@ -27,6 +28,10 @@ const P012: u32 = u32::from_le_bytes(*b"P012");
 const P016: u32 = u32::from_le_bytes(*b"P016");
 const YUV444P: u32 = u32::from_le_bytes(*b"444P");
 const Q416: u32 = u32::from_le_bytes(*b"Q416");
+/// Packed 8-bit RGB surfaces, by memory byte order. VA_FOURCC_ARGB / XRGB name the
+/// little-endian 0xAARRGGBB word (bytes B, G, R, A) as in Chromium and the C driver.
+const RGB_BGRA: [u32; 4] = [VA_FOURCC_BGRA, VA_FOURCC_BGRX, VA_FOURCC_ARGB, VA_FOURCC_XRGB];
+const RGB_RGBA: [u32; 2] = [VA_FOURCC_RGBA, VA_FOURCC_RGBX];
 const ENC_MAX_DIM: u32 = 8192;
 const MAX_DIM: u32 = 8192;
 /// Decode profiles, as the C driver reports them on NVDEC hardware that decodes them all (VP9 and
@@ -82,9 +87,10 @@ fn profile_rt(profile: VAProfile) -> u32 {
     }
 }
 
-/// Pixel format of a decode surface. 10/12-bit samples sit in the high bits of 16-bit containers
+/// Pixel format of a surface. 10/12-bit samples sit in the high bits of 16-bit containers
 /// (P010/P012, Q416), exactly as the engine writes them; 12-bit 4:2:0 is P012, 4:4:4 above 8 bits
-/// is Q416 (three planes), as in the C driver.
+/// is Q416 (three planes), as in the C driver. RGB surfaces (VideoProc only) hold one plane of
+/// 4-byte pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Format {
     pub fourcc: u32,
@@ -114,10 +120,22 @@ impl Format {
             P012 => Self::of_rt(VA_RT_FORMAT_YUV420_12),
             YUV444P => Self::of_rt(VA_RT_FORMAT_YUV444),
             Q416 => Self::of_rt(VA_RT_FORMAT_YUV444_10),
+            f if RGB_BGRA.contains(&f) || RGB_RGBA.contains(&f) => Some(Self { fourcc, bit_depth: 8, chroma_444: false }),
             _ => None,
         }
     }
+    /// Whether this is a packed RGB format.
+    pub fn rgb(self) -> bool {
+        RGB_BGRA.contains(&self.fourcc) || RGB_RGBA.contains(&self.fourcc)
+    }
+    /// The DRM format of an RGB surface's one plane.
+    fn rgb_drm(self) -> u32 {
+        if RGB_RGBA.contains(&self.fourcc) { u32::from_le_bytes(*b"AB24") } else { u32::from_le_bytes(*b"AR24") }
+    }
     pub fn rt(self) -> u32 {
+        if self.rgb() {
+            return VA_RT_FORMAT_RGB32;
+        }
         match (self.chroma_444, self.bit_depth) {
             (false, 8) => VA_RT_FORMAT_YUV420,
             (false, 10) => VA_RT_FORMAT_YUV420_10,
@@ -128,11 +146,11 @@ impl Format {
         }
     }
     pub fn bytes_per_sample(self) -> u32 {
-        if self.bit_depth > 8 { 2 } else { 1 }
+        if self.rgb() { 4 } else if self.bit_depth > 8 { 2 } else { 1 }
     }
-    /// Planes in memory: luma + interleaved CbCr, or luma + Cb + Cr.
+    /// Planes in memory: luma + interleaved CbCr, luma + Cb + Cr, or one RGB plane.
     pub fn planes(self) -> usize {
-        if self.chroma_444 { 3 } else { 2 }
+        if self.rgb() { 1 } else if self.chroma_444 { 3 } else { 2 }
     }
     /// The RM copy-out target format.
     pub fn target(self) -> u32 {
@@ -160,6 +178,9 @@ impl Format {
     pub fn layer_formats(self) -> [u32; 3] {
         let (r8, rg88) = (u32::from_le_bytes(*b"R8  "), u32::from_le_bytes(*b"RG88"));
         let (r16, rg1616) = (u32::from_le_bytes(*b"R16 "), u32::from_le_bytes(*b"RG32"));
+        if self.rgb() {
+            return [self.rgb_drm(), 0, 0];
+        }
         match (self.chroma_444, self.bytes_per_sample()) {
             (false, 1) => [r8, rg88, 0],
             (false, _) => [r16, rg1616, 0],
@@ -174,6 +195,9 @@ impl Format {
     }
     /// The single DRM format of a composed layer, if one exists (Q416 has none).
     pub fn composed_format(self) -> Option<u32> {
+        if self.rgb() {
+            return Some(self.rgb_drm());
+        }
         match self.fourcc {
             NV12 => Some(NV12),
             P010 => Some(P010),
@@ -465,14 +489,17 @@ struct Surface {
     output: Option<backend::Export>,
     output_dirty: bool,
     input: Option<encode::Input>,
+    /// Latest queued VideoProc output into this surface; its picture is then in `import` or the
+    /// `backing` of `output`, and `decode` / `input` no longer apply.
+    processed: Option<Arc<Completion>>,
     /// A client's DRM PRIME buffer this surface was created over; the encoder reads it in place.
     import: Option<Arc<import::Dma>>,
-    /// The encoder's view of `output`, created on first use.
+    /// The GPU view of `output` (encoder, VideoProc), created on first use.
     backing: Option<Arc<import::Dma>>,
 }
 impl Surface {
     fn pending(&self) -> Vec<Arc<Completion>> {
-        self.decode.iter().chain(&self.copy).cloned().collect()
+        self.decode.iter().chain(&self.copy).chain(&self.processed).cloned().collect()
     }
 }
 struct Buffer {
@@ -498,6 +525,11 @@ struct Driver {
     buffers: HashMap<u32, Buffer>,
     images: HashMap<u32, VAImage>,
     output_worker: Option<OutputWorker>,
+    vpp_configs: HashSet<u32>,
+    vpp_contexts: HashMap<u32, vpp::Context>,
+    vpp: Option<vpp::Worker>,
+    /// Whether this GPU runs VideoProc, probed on first query.
+    vpp_ok: Option<bool>,
 }
 impl Driver {
     fn new(pci: [u32; 4]) -> Self {
@@ -512,6 +544,10 @@ impl Driver {
             buffers: HashMap::new(),
             images: HashMap::new(),
             output_worker: None,
+            vpp_configs: HashSet::new(),
+            vpp_contexts: HashMap::new(),
+            vpp: None,
+            vpp_ok: None,
         }
     }
     fn id(&mut self) -> R<u32> {
@@ -572,24 +608,55 @@ impl Driver {
         self.ensure_output(id)?;
         gpu(self.surface(id)?.output.as_ref().ok_or(FAILED)?.try_clone())
     }
-    /// What the encoder ingests for a picture on `id`: the client's imported buffer, or the GPU view
-    /// of a decode surface's exported backing, with the work that must complete before reading it.
-    fn encoder_source(&mut self, id: u32) -> R<Option<(Arc<import::Dma>, Vec<Arc<Completion>>)>> {
-        let s = self.surface(id)?;
-        if let Some(dma) = &s.import {
-            return Ok(Some((dma.clone(), Vec::new())));
+    fn vpp_supported(&mut self) -> bool {
+        let pci = self.pci;
+        *self.vpp_ok.get_or_insert_with(|| {
+            nvrm::video::vpp::Processor::supported(pci).unwrap_or_else(|e| {
+                log::log!("VideoProc unavailable: {e}");
+                false
+            })
+        })
+    }
+    fn vpp_worker(&mut self) -> R<&vpp::Worker> {
+        if self.vpp.is_none() {
+            self.vpp = Some(vpp::Worker::new(self.pci)?);
         }
-        if s.decode.is_none() {
-            return Ok(None);
-        }
-        self.ensure_output(id)?;
-        let s = self.surfaces.get_mut(&id).unwrap();
+        Ok(self.vpp.as_ref().unwrap())
+    }
+    /// The GPU view of the surface's exported backing, created on first use.
+    fn backing(&mut self, id: u32) -> R<Arc<import::Dma>> {
+        let s = self.surfaces.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
         if s.backing.is_none() {
             let o = s.output.as_ref().ok_or(FAILED)?;
             let dma = import::Dma::from_backing(s.fourcc, &o.fds[0], o.size, o.modifier, o.pitches[0], o.offsets, s.width, s.height)?;
             s.backing = Some(Arc::new(dma));
         }
-        Ok(Some((s.backing.clone().unwrap(), s.pending())))
+        Ok(s.backing.clone().unwrap())
+    }
+    /// Where the GPU reads the picture on `id` (the client's imported buffer, or the exported
+    /// backing of a decoded or processed surface), with the work that must complete first; `None`
+    /// for a surface whose picture only exists in CPU memory.
+    fn gpu_view(&mut self, id: u32) -> R<Option<(Arc<import::Dma>, Vec<Arc<Completion>>)>> {
+        let s = self.surface(id)?;
+        if let Some(dma) = &s.import {
+            return Ok(Some((dma.clone(), s.pending())));
+        }
+        if s.decode.is_none() && s.processed.is_none() {
+            return Ok(None);
+        }
+        self.ensure_output(id)?;
+        let dma = self.backing(id)?;
+        Ok(Some((dma, self.surface(id)?.pending())))
+    }
+    /// Where VideoProc writes the picture of `id`, with the work on it that must complete first.
+    fn target_view(&mut self, id: u32) -> R<(Arc<import::Dma>, Vec<Arc<Completion>>)> {
+        let s = self.surface(id)?;
+        if let Some(dma) = &s.import {
+            return Ok((dma.clone(), s.pending()));
+        }
+        self.ensure_output(id)?;
+        let dma = self.backing(id)?;
+        Ok((dma, self.surface(id)?.pending()))
     }
 }
 unsafe fn array<'a, T>(p: *const T, n: usize) -> R<&'a [T]> {
@@ -695,18 +762,22 @@ macro_rules! callback_unlocked {
         unsafe extern "C" fn $name($ctx: VADriverContextP, $($arg: $ty),*) -> VAStatus { log::debug!("{}", stringify!($name)); logged(stringify!($name), invoke_unlocked($ctx, |$m| $body)) }
     };
 }
-callback!(query_profiles(ctx, list: *mut VAProfile, n: *mut i32) |_d| {
-    encode::query_profiles(list, n)
+callback!(query_profiles(ctx, list: *mut VAProfile, n: *mut i32) |d| {
+    let vpp = d.vpp_supported();
+    encode::query_profiles(list, n, vpp)
 });
-callback!(query_entrypoints(ctx, p: VAProfile, list: *mut VAEntrypoint, n: *mut i32) |_d| {
-    encode::query_entrypoints(p, list, n)
+callback!(query_entrypoints(ctx, p: VAProfile, list: *mut VAEntrypoint, n: *mut i32) |d| {
+    let vpp = p == VAProfileNone && d.vpp_supported();
+    encode::query_entrypoints(p, list, n, vpp)
 });
-callback!(get_config_attributes(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32) |_d| {
+callback!(get_config_attributes(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32) |d| {
     if e == VAEntrypointEncSlice { return encode::get_attributes(p, attrs, n); }
+    if e == VAEntrypointVideoProc { return vpp::get_attributes(d, p, attrs, n); }
     supported(p, e)?; for i in 0..count(n)? { let a = array(attrs, count(n)?)?[i]; (*attrs.add(i)).value = attribute(p, a.type_); } Ok(())
 });
 callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfigAttrib, n: i32, id: *mut u32) |d| {
     if e == VAEntrypointEncSlice { return encode::create_config(d, p, attrs, n, id); }
+    if e == VAEntrypointVideoProc { return vpp::create_config(d, p, attrs, n, id); }
     supported(p, e)?; if id.is_null() { return Err(INVALID); }
     let mut rt = 0;
     // As the C driver, only the render-target formats matter: the client names those it will use, and they must be among the profile's.
@@ -718,9 +789,10 @@ callback!(create_config(ctx, p: VAProfile, e: VAEntrypoint, attrs: *mut VAConfig
     }
     let key = d.id()?; d.configs.insert(key, (p, rt)); out(id, key)
 });
-callback!(destroy_config(ctx, id: u32) |d| { if d.enc_configs.remove(&id).is_some() { return Ok(()); } d.configs.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?; Ok(()) });
+callback!(destroy_config(ctx, id: u32) |d| { if d.enc_configs.remove(&id).is_some() || d.vpp_configs.remove(&id) { return Ok(()); } d.configs.remove(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?; Ok(()) });
 callback!(query_config(ctx, id: u32, p: *mut VAProfile, e: *mut VAEntrypoint, attrs: *mut VAConfigAttrib, n: *mut i32) |d| {
     if let Some(&(profile, _)) = d.enc_configs.get(&id) { return encode::query_config(profile, p, e, attrs, n); }
+    if d.vpp_configs.contains(&id) { return vpp::query_config(p, e, attrs, n); }
     let (profile, _) = *d.configs.get(&id).ok_or(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus)?;
     if p.is_null() || e.is_null() || attrs.is_null() || n.is_null() { return Err(INVALID); }
     out(p, profile)?; out(e, VAEntrypointVLD)?;
@@ -729,14 +801,14 @@ callback!(query_config(ctx, id: u32, p: *mut VAProfile, e: *mut VAEntrypoint, at
 /// Surface creation parameters from `VASurfaceAttrib`: the picture format, and the client's DRM
 /// PRIME buffer when the surfaces wrap one (dimensions then come from the descriptor).
 unsafe fn surface_attributes(attrs: &[VASurfaceAttrib], format: u32, w: &mut u32, h: &mut u32) -> R<(u32, Option<Arc<import::Dma>>)> {
-    let mut fourcc = Format::of_rt(format).map_or(NV12, |f| f.fourcc);
+    let mut fourcc = if format == VA_RT_FORMAT_RGB32 { VA_FOURCC_BGRA } else { Format::of_rt(format).map_or(NV12, |f| f.fourcc) };
     let (mut memory, mut descriptor) = (0, ptr::null_mut());
     for a in attrs {
         if a.flags & VA_SURFACE_ATTRIB_SETTABLE == 0 { continue; }
         match a.type_ {
             va::VASurfaceAttribPixelFormat | va::VASurfaceAttribMemoryType | va::VASurfaceAttribUsageHint if a.value.type_ != VAGenericValueTypeInteger => return Err(INVALID),
             va::VASurfaceAttribExternalBufferDescriptor if a.value.type_ != VAGenericValueTypePointer => return Err(INVALID),
-            va::VASurfaceAttribPixelFormat if encode::INPUT_FORMATS.contains(&(a.value.value.i as u32)) => fourcc = a.value.value.i as u32,
+            va::VASurfaceAttribPixelFormat if encode::INPUT_FORMATS.contains(&(a.value.value.i as u32)) || Format::of_fourcc(a.value.value.i as u32).is_some_and(Format::rgb) => fourcc = a.value.value.i as u32,
             va::VASurfaceAttribPixelFormat if import::Kind::of(a.value.value.i as u32).is_some() => (),
             va::VASurfaceAttribMemoryType => memory = a.value.value.i as u32,
             va::VASurfaceAttribExternalBufferDescriptor => descriptor = a.value.value.p,
@@ -778,13 +850,13 @@ callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32,
     let (mut w, mut h) = (w, h);
     let (fourcc, import) = surface_attributes(array(attrs, na as usize)?, format, &mut w, &mut h)?;
     if import.is_some() && n != 1 { return Err(INVALID); }
-    if format == VA_RT_FORMAT_RGB32 && import.is_none() { return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus); }
+    if format == VA_RT_FORMAT_RGB32 && !Format::of_fourcc(fourcc).is_some_and(Format::rgb) && import.is_none() { return Err(VA_STATUS_ERROR_UNSUPPORTED_RT_FORMAT as VAStatus); }
     dimensions(w, h, ENC_MAX_DIM)?;
     for i in 0..n as usize {
         let id = d.id()?;
         d.surfaces.insert(id, Surface {
             width: w, height: h, fourcc, owner: None, worker: None, extent: (w, h),
-            decode: None, copy: None, output: None, output_dirty: false, input: None,
+            decode: None, copy: None, output: None, output_dirty: false, input: None, processed: None,
             import: import.clone(), backing: None,
         });
         surfaces.add(i).write(id);
@@ -824,11 +896,13 @@ callback!(destroy_surfaces(ctx, ids: *mut u32, n: i32) |d| {
         if s.output.is_some() { d.output_worker.as_ref().ok_or(FAILED)?.tx.send(OutputCommand::Release(*id)).map_err(|_| FAILED)?; }
         for c in d.contexts.values_mut() { c.targets.remove(id); }
         for session in d.enc_contexts.values() { session.forget(*id); }
+        if let Some(vpp) = &d.vpp { vpp.forget(*id); }
     }
     Ok(())
 });
 callback!(create_context(ctx, config: u32, w: i32, h: i32, flags: i32, targets: *mut u32, n: i32, id: *mut u32) |d| {
     if let Some(&config) = d.enc_configs.get(&config) { return encode::create_context(d, config, w, h, targets, n, id); }
+    if d.vpp_configs.contains(&config) { return vpp::create_context(d, w, h, id); }
     if !d.configs.contains_key(&config) { return Err(VA_STATUS_ERROR_INVALID_CONFIG as VAStatus); }
     if id.is_null() || w <= 0 || h <= 0 { return Err(INVALID); } dimensions(w as u32, h as u32, MAX_DIM)?;
     if flags & !(VA_PROGRESSIVE as i32) != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
@@ -878,7 +952,7 @@ fn retarget(d: &mut Driver, id: u32, target: u32) -> R {
     let fourcc = d.surface(target)?.fourcc;
     let c = d.context(id)?;
     if !c.adaptive || fourcc == c.format.fourcc { return Ok(()); }
-    let format = Format::of_fourcc(fourcc).filter(|f| !f.chroma_444).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
+    let format = Format::of_fourcc(fourcc).filter(|f| !f.chroma_444 && !f.rgb()).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
     let worker = Arc::new(Worker::new(c.codec, d.pci, c.width, c.height, c.targets.len(), format)?);
     let c = d.contexts.get_mut(&id).unwrap();
     c.worker = worker;
@@ -886,7 +960,7 @@ fn retarget(d: &mut Driver, id: u32, target: u32) -> R {
     Ok(())
 }
 callback!(destroy_context(ctx, id: u32) |d| {
-    if d.enc_contexts.remove(&id).is_some() {
+    if d.enc_contexts.remove(&id).is_some() || d.vpp_contexts.remove(&id).is_some() {
         d.buffers.retain(|_, b| b.context != Some(id));
         return Ok(());
     }
@@ -912,7 +986,9 @@ fn buffer_shape(codec: backend::Codec, kind: VABufferType, size: u32) -> bool {
 }
 callback!(create_buffer(ctx, context: u32, kind: VABufferType, size: u32, n: u32, data: *mut c_void, id: *mut u32) |d| {
     if id.is_null() || n == 0 { return Err(INVALID); }
-    if !d.enc_contexts.contains_key(&context) {
+    if d.vpp_contexts.contains_key(&context) {
+        if !vpp::buffer_shape(kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
+    } else if !d.enc_contexts.contains_key(&context) {
         let codec = d.context(context)?.codec;
         if !buffer_shape(codec, kind, size) { return Err(VA_STATUS_ERROR_UNSUPPORTED_BUFFERTYPE as VAStatus); }
     }
@@ -938,6 +1014,7 @@ callback!(unmap_buffer(ctx, id: u32) |d| { encode::unmap_buffer(d, id) });
 callback!(destroy_buffer(ctx, id: u32) |d| { let b = d.buffer(id)?; if b.mapped || b.context.is_none() { return Err(INVALID); } d.buffers.remove(&id); Ok(()) });
 callback!(buffer_info(ctx, id: u32, kind: *mut VABufferType, size: *mut u32, n: *mut u32) |d| { let b = d.buffer(id)?; out(kind, b.kind)?; out(size, b.size)?; out(n, b.count) });
 callback!(begin_picture(ctx, id: u32, target: u32) |d| {
+    if d.vpp_contexts.contains_key(&id) { return vpp::begin_picture(d, id, target); }
     if d.enc_contexts.contains_key(&id) {
         d.surface(target)?;
         if busy(d, target) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); }
@@ -955,9 +1032,10 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
     let s = d.surfaces.get_mut(&target).unwrap();
     // A surface moving to another decoder must not keep its picture alive in the previous one.
     if let Some(previous) = s.worker.replace(worker.clone()).filter(|p| !Arc::ptr_eq(p, &worker)) { let _ = previous.tx.send(Command::Release(target)); }
-    s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.output_dirty = true; Ok(())
+    s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.processed = None; s.output_dirty = true; Ok(())
 });
 callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
+    if d.vpp_contexts.contains_key(&id) { return vpp::render_picture(d, id, ids, n); }
     if d.enc_contexts.contains_key(&id) { return encode::render_picture(d, id, ids, n); }
     if d.context(id)?.frame.is_none() { return Err(INVALID); }
     let ids = array(ids, count(n)?)?;
@@ -1027,7 +1105,7 @@ fn encode_picture(d: &mut Driver, id: u32) -> R {
     let target = c.target.ok_or(INVALID)?;
     let coded = c.coded.ok_or(INVALID)?;
     let (w, h) = d.surface(target)?.extent;
-    let frame = match d.encoder_source(target)? {
+    let frame = match d.gpu_view(target)? {
         Some((dma, ready)) => encode::Frame::Dma { key: target, dma, ready },
         None => encode::Frame::Cpu(d.surfaces.get_mut(&target).unwrap().input.take().ok_or(INVALID)?),
     };
@@ -1046,6 +1124,7 @@ fn encode_picture(d: &mut Driver, id: u32) -> R {
 }
 // Queues the decode and returns; its outcome is reported by vaSyncSurface.
 callback!(end_picture(ctx, id: u32) |d| {
+    if d.vpp_contexts.contains_key(&id) { return vpp::end_picture(d, id); }
     if d.enc_contexts.contains_key(&id) {
         return encode_picture(d, id);
     }
@@ -1064,6 +1143,7 @@ callback!(end_picture(ctx, id: u32) |d| {
 fn busy(d: &Driver, id: u32) -> bool {
     d.contexts.values().any(|c| c.frame.as_ref().is_some_and(|f| f.target == id))
         || d.enc_contexts.values().any(|c| c.target == Some(id))
+        || d.vpp_contexts.values().any(|c| c.target == Some(id))
 }
 callback_unlocked!(sync_surface(ctx, id: u32) |m| {
     let pending = { let d = lock(m)?; let s = d.surface(id)?; if busy(&d, id) { return Err(VA_STATUS_ERROR_SURFACE_BUSY as VAStatus); } s.pending() };
@@ -1091,9 +1171,10 @@ callback!(query_status(ctx, id: u32, status: *mut VASurfaceStatus) |d| {
     out(status, if rendering { VASurfaceRendering } else { VASurfaceReady })
 });
 callback!(query_surface_error(ctx, id: u32, _status: VAStatus, _info: *mut *mut c_void) |d| { d.surface(id)?; Err(UNIMPL) });
-/// `VAImageFormat` of `fourcc`, with the C driver's bits per pixel.
+/// `VAImageFormat` of `fourcc`, with the C driver's bits per pixel; RGB with its channel masks
+/// (of the little-endian pixel word).
 fn image_format(fourcc: u32) -> VAImageFormat {
-    VAImageFormat {
+    let mut format = VAImageFormat {
         fourcc,
         byte_order: VA_LSB_FIRST,
         bits_per_pixel: match fourcc {
@@ -1102,10 +1183,22 @@ fn image_format(fourcc: u32) -> VAImageFormat {
             _ => 12,
         },
         ..Default::default()
+    };
+    if Format::of_fourcc(fourcc).is_some_and(Format::rgb) {
+        let alpha = matches!(fourcc, VA_FOURCC_BGRA | VA_FOURCC_ARGB | VA_FOURCC_RGBA);
+        let (r, b) = if RGB_RGBA.contains(&fourcc) { (0xff, 0xff_0000) } else { (0xff_0000, 0xff) };
+        format.bits_per_pixel = 32;
+        format.depth = if alpha { 32 } else { 24 };
+        format.red_mask = r;
+        format.green_mask = 0xff00;
+        format.blue_mask = b;
+        format.alpha_mask = if alpha { 0xff00_0000 } else { 0 };
     }
+    format
 }
-/// Image formats for surfaces: what decode surfaces read back as and encoder inputs upload as.
-pub(crate) const IMAGE_FORMATS: [u32; 6] = [NV12, P010, P012, P016, YUV444P, Q416];
+/// Image formats for surfaces: what decode surfaces read back as, encoder inputs upload as, and
+/// VideoProc reads and writes.
+pub(crate) const IMAGE_FORMATS: [u32; 12] = vpp::FORMATS;
 fn new_input(fourcc: u32, w: u32, h: u32) -> encode::Input {
     let format = packed_format(fourcc);
     let (pitch, offsets, size) = format.packed(w, h);
@@ -1128,6 +1221,9 @@ fn input_image(d: &mut Driver, input: &encode::Input, w: u32, h: u32) -> R<VAIma
     if !format.chroma_444 {
         image.pitches[2] = 0;
     }
+    if format.rgb() {
+        image.pitches[1] = 0;
+    }
     image.offsets = input.offsets.map(|v| v as u32);
     image.data_size = input.bytes.len() as u32;
     d.images.insert(image.image_id, image);
@@ -1147,7 +1243,7 @@ fn allocate_image(d: &mut Driver, w: u32, h: u32, fourcc: u32) -> R<VAImage> {
         height: h as u16,
         data_size: size as u32,
         num_planes: format.planes() as u32,
-        pitches: [pitch, pitch, if format.chroma_444 { pitch } else { 0 }],
+        pitches: [pitch, if format.planes() > 1 { pitch } else { 0 }, if format.planes() > 2 { pitch } else { 0 }],
         offsets,
         ..Default::default()
     };
@@ -1174,7 +1270,13 @@ callback!(create_image(ctx, format: *mut VAImageFormat, w: i32, h: i32, image: *
 callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
     if image.is_null() { return Err(INVALID); }
     if let Some(value) = encode::derive_input_image(&mut *lock(m)?, surface)? { return out(image, value); }
-    let (w, h, fourcc) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc) };
+    let (w, h, fourcc, on_gpu) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc, s.processed.is_some() || s.import.is_some()) };
+    if on_gpu {
+        let value = { let mut d = lock(m)?; let value = allocate_image(&mut d, w, h, fourcc)?; d.buffers.get_mut(&value.buf).unwrap().bytes = vec![0; value.data_size as usize]; value };
+        let result = vpp::readback(m, surface, nvrm::video::vpp::Rect { x: 0, y: 0, width: w, height: h }, value.buf);
+        if let Err(e) = result { let mut d = lock(m)?; d.images.remove(&value.image_id); d.buffers.remove(&value.buf); return Err(e); }
+        return out(image, value);
+    }
     decoded(m, surface)?.wait()?;
     let mut d = lock(m)?;
     let value = allocate_image(&mut d, w, h, fourcc)?;
@@ -1192,6 +1294,9 @@ callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, 
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
     // The copy engine converts neither depth nor chroma format: the image is the surface's own format.
     if image.format.fourcc != fourcc && !(fourcc == P010 && image.format.fourcc == P016) && !(fourcc == P012 && image.format.fourcc == P016) { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); }
+    if { let d = lock(m)?; let s = d.surface(surface)?; s.processed.is_some() || s.import.is_some() } {
+        return vpp::readback(m, surface, nvrm::video::vpp::Rect { x, y, width: w, height: h }, image.buf);
+    }
     decoded(m, surface)?.wait()?;
     readback(&mut lock(m)?, surface, backend::Rect { x: x as u32, y: y as u32, w, h }, image.buf)
 });
@@ -1512,9 +1617,14 @@ pub unsafe extern "C" fn __vaDriverInit_1_0(ctx: VADriverContextP) -> VAStatus {
         table.vaSyncBuffer = Some(sync_buffer);
         table.vaCopy = Some(copy_object);
         table.vaMapBuffer2 = Some(map_buffer2);
+        if let Some(vpp_table) = (*ctx).vtable_vpp.as_mut() {
+            vpp_table.vaQueryVideoProcFilters = Some(vpp::query_filters);
+            vpp_table.vaQueryVideoProcFilterCaps = Some(vpp::query_filter_caps);
+            vpp_table.vaQueryVideoProcPipelineCaps = Some(vpp::query_pipeline_caps);
+        }
         (*ctx).version_major = VA_MAJOR_VERSION as i32;
         (*ctx).version_minor = VA_MINOR_VERSION as i32;
-        (*ctx).max_profiles = (PROFILES.len() + encode::PROFILES.len()) as i32;
+        (*ctx).max_profiles = (PROFILES.len() + encode::PROFILES.len() + 1) as i32;
         (*ctx).max_entrypoints = 2;
         (*ctx).max_attributes = 64;
         (*ctx).max_image_formats = IMAGE_FORMATS.len() as i32;

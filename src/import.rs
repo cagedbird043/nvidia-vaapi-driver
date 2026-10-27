@@ -2,15 +2,17 @@
 //! dma-buf-backed picture (a client's buffer, or a decode surface's exported backing); the encoder
 //! thread ingests it on the copy engine without touching the pixels on the CPU.
 use crate::{va::*, FAILED, INVALID, NV12, P010, Q416, R, YUV444P};
-use nvrm::video::enc::ingest;
+use nvrm::video::{enc::ingest, vpp};
 use std::{
     os::fd::{AsRawFd, BorrowedFd, OwnedFd},
 };
 
 /// DRM_FORMAT_ARGB8888 / XRGB8888 ("AR24" / "XR24"): the same little-endian BGRA byte order as
-/// VA_FOURCC_ARGB / XRGB.
+/// VA_FOURCC_ARGB / XRGB; DRM_FORMAT_ABGR8888 / XBGR8888 ("AB24" / "XB24"): bytes R, G, B, A.
 const AR24: u32 = u32::from_le_bytes(*b"AR24");
 const XR24: u32 = u32::from_le_bytes(*b"XR24");
+const AB24: u32 = u32::from_le_bytes(*b"AB24");
+const XB24: u32 = u32::from_le_bytes(*b"XB24");
 const P012: u32 = VA_FOURCC_P012;
 const P016: u32 = VA_FOURCC_P016;
 const DRM_FORMAT_MOD_LINEAR: u64 = 0;
@@ -30,6 +32,8 @@ pub enum Kind {
     Q416,
     /// 8-bit B, G, R, A in memory order.
     Bgra,
+    /// 8-bit R, G, B, A in memory order (VideoProc only; the encoder takes BGRA).
+    Rgba,
 }
 impl Kind {
     pub fn of(fourcc: u32) -> Option<Self> {
@@ -38,13 +42,14 @@ impl Kind {
             P010 | P012 | P016 => Some(Kind::P01x),
             YUV444P => Some(Kind::Yuv444),
             Q416 => Some(Kind::Q416),
-            VA_FOURCC_ARGB | VA_FOURCC_XRGB | AR24 | XR24 => Some(Kind::Bgra),
+            VA_FOURCC_ARGB | VA_FOURCC_XRGB | VA_FOURCC_BGRA | VA_FOURCC_BGRX | AR24 | XR24 => Some(Kind::Bgra),
+            VA_FOURCC_RGBA | VA_FOURCC_RGBX | AB24 | XB24 => Some(Kind::Rgba),
             _ => None,
         }
     }
     fn planes(self) -> usize {
         match self {
-            Kind::Bgra => 1,
+            Kind::Bgra | Kind::Rgba => 1,
             Kind::Nv12 | Kind::P01x => 2,
             Kind::Yuv444 | Kind::Q416 => 3,
         }
@@ -53,7 +58,7 @@ impl Kind {
         match self {
             Kind::Nv12 | Kind::Yuv444 => 1,
             Kind::P01x | Kind::Q416 => 2,
-            Kind::Bgra => 4,
+            Kind::Bgra | Kind::Rgba => 4,
         }
     }
 }
@@ -167,7 +172,7 @@ impl Dma {
     /// `offsets[1]` (CbCr) for 4:2:0, or `offsets[1]` (Cb) and `offsets[2]` (Cr) for 4:4:4.
     #[allow(clippy::too_many_arguments)]
     pub fn from_backing(fourcc: u32, fd: &OwnedFd, size: u32, modifier: u64, pitch: u32, offsets: [u32; 3], width: u32, height: u32) -> R<Self> {
-        let kind = Kind::of(fourcc).filter(|k| *k != Kind::Bgra).ok_or(INVALID)?;
+        let kind = Kind::of(fourcc).ok_or(INVALID)?;
         let planes = offsets[..kind.planes()].iter().map(|&offset| Plane { object: 0, offset, pitch }).collect();
         let objects = vec![fd.try_clone().map_err(|_| FAILED)?];
         let dma = Self { fourcc, kind, width, height, objects, sizes: vec![size], modifiers: vec![modifier], planes };
@@ -200,11 +205,33 @@ impl Dma {
             chroma444: matches!(self.kind, Kind::Yuv444 | Kind::Q416),
         })
     }
+    /// The VideoProc view of this buffer's samples.
+    pub fn pixels(&self) -> vpp::Pixels {
+        match self.kind {
+            Kind::Nv12 => vpp::Pixels::Yuv420 { bits: 8 },
+            Kind::P01x => vpp::Pixels::Yuv420 { bits: match self.fourcc { P010 => 10, P012 => 12, _ => 16 } },
+            Kind::Yuv444 => vpp::Pixels::Yuv444 { bits: 8 },
+            Kind::Q416 => vpp::Pixels::Yuv444 { bits: 10 },
+            Kind::Bgra => vpp::Pixels::Rgb(vpp::RgbOrder::Bgra),
+            Kind::Rgba => vpp::Pixels::Rgb(vpp::RgbOrder::Rgba),
+        }
+    }
+    /// The VideoProc picture of this buffer, named `key` in the import cache; borrows the descriptors.
+    pub fn picture(&self, key: u64) -> R<vpp::Picture<'_>> {
+        let source = self.source()?;
+        Ok(vpp::Picture {
+            pixels: self.pixels(),
+            width: self.width,
+            height: self.height,
+            memory: vpp::Memory::Dma { key, planes: source.planes, layout: source.layout },
+        })
+    }
     /// Duplicated objects and per-plane geometry for `vaExportSurfaceHandle`.
     pub fn export(&self, composed: bool) -> R<VADRMPRIMESurfaceDescriptor> {
         let planes = self.kind.planes();
         let composed_format = match self.kind {
             Kind::Bgra => Some(AR24),
+            Kind::Rgba => Some(AB24),
             Kind::Yuv444 => Some(u32::from_le_bytes(*b"YU24")),
             Kind::Q416 => None,
             Kind::Nv12 | Kind::P01x => Some(self.fourcc),
@@ -228,6 +255,7 @@ impl Dma {
             (Kind::P01x | Kind::Q416, 0) | (Kind::Q416, _) => u32::from_le_bytes(*b"R16 "),
             (Kind::P01x, _) => u32::from_le_bytes(*b"RG32"),
             (Kind::Bgra, _) => AR24,
+            (Kind::Rgba, _) => AB24,
         };
         desc.num_layers = layers as u32;
         for (l, layer) in desc.layers[..layers].iter_mut().enumerate() {
