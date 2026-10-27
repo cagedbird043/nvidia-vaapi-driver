@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "nv-bionic-native"
 version = "0.1.0"
-source = "git+https://github.com/cagedbird043/nvrm?rev=25b6f13e114903ff7d73601e49e415158d22789c#25b6f13e114903ff7d73601e49e415158d22789c"
+source = "git+https://github.com/cagedbird043/nvrm?rev=88038d47b91210e59ee469e9abebf381c420015d#88038d47b91210e59ee469e9abebf381c420015d"
 dependencies = [
  "ash",
 ]
@@ -207,7 +207,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustnv-vaapi"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bindgen",
  "nv-bionic-native",
