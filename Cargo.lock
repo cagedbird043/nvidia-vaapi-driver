@@ -137,7 +137,7 @@ dependencies = [
 [[package]]
 name = "nv-bionic-native"
 version = "0.1.0"
-source = "git+https://github.com/cagedbird043/nvrm?rev=88038d47b91210e59ee469e9abebf381c420015d#88038d47b91210e59ee469e9abebf381c420015d"
+source = "git+https://github.com/cagedbird043/nvrm?rev=fbfe3d384e27e5621473096e5e27764336094a67#fbfe3d384e27e5621473096e5e27764336094a67"
 dependencies = [
  "ash",
 ]

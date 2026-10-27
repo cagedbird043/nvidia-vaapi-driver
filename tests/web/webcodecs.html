@@ -1,0 +1,86 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>rustnv WebCodecs</title>
+<canvas id="c" width="1280" height="720"></canvas>
+<script>
+// Driven by tests/chrome.py. Every picture carries its frame number as eight black / white
+// squares; each case checks that output frame i shows frame i (no stale or reordered pictures).
+const log = (...a) => console.log("WCTEST", ...a);
+const N = 60, W = 1280, H = 720, US = 33333;
+const c = document.getElementById("c"), g = c.getContext("2d", { willReadFrequently: true });
+function paint(i) {
+  g.fillStyle = `hsl(${i * 6},80%,50%)`; g.fillRect(0, 0, W, H);
+  g.fillStyle = "#fff"; g.fillRect(100 + i * 16, 200, 200, 200);
+  g.fillStyle = "#000"; g.fillRect(1000 - i * 12, 420, 120, 160);
+  for (let b = 0; b < 8; b++) { g.fillStyle = (i >> b) & 1 ? "#fff" : "#000"; g.fillRect(200 + b * 50, 120, 40, 40); }
+}
+// The frame number painted by paint(), seen through `rect` scaled to W x H; -1: unreadable.
+function code(img, rect) {
+  g.drawImage(img, 0, 0, W, H);
+  const px = g.getImageData(0, 0, W, H).data, r = rect || { x: 0, y: 0, width: W, height: H };
+  let n = 0;
+  for (let b = 0; b < 8; b++) {
+    const x = Math.round((200 + b * 50 + 20 - r.x) * W / r.width), y = Math.round((140 - r.y) * H / r.height);
+    const o = (y * W + x) * 4, v = (px[o] + px[o + 1] + px[o + 2]) / 3;
+    if (v > 64 && v < 192) return -1;
+    if (v >= 192) n |= 1 << b;
+  }
+  return n;
+}
+function report(name, seen, err) {
+  const bad = seen.filter(([i, n]) => i !== n);
+  log("CASE", name, bad.length === 0 && seen.length === N && !err ? "PASS" : "FAIL",
+      `frames=${seen.length} wrong=${bad.length}`, JSON.stringify(bad.slice(0, 8)), err || "");
+}
+function encoder(accel, sink) {
+  const out = { chunks: [], config: null, err: null };
+  const enc = new VideoEncoder({ output: (ch, m) => { if (m && m.decoderConfig) out.config = m.decoderConfig; out.chunks.push(ch); }, error: (e) => out.err = String(e) });
+  enc.configure({ codec: "avc1.640028", width: W, height: H, bitrate: 20e6, framerate: 30, hardwareAcceleration: accel });
+  return [enc, out];
+}
+async function decode(src, accel, onFrame) {
+  let err = null;
+  const dec = new VideoDecoder({ output: onFrame, error: (e) => err = String(e) });
+  dec.configure({ ...src.config, hardwareAcceleration: accel });
+  for (const ch of src.chunks) dec.decode(ch);
+  await dec.flush(); dec.close();
+  return err;
+}
+async function codes(src, accel, rect) {
+  const seen = [];
+  const err = await decode(src, accel, (f) => { seen.push([Math.round(f.timestamp / US), code(f, rect)]); f.close(); });
+  return [seen, err || src.err];
+}
+// Hardware decode, optionally cropped, handed frame by frame to the hardware encoder.
+async function transcode(src, rect) {
+  const [enc, out] = encoder("prefer-hardware");
+  const err = await decode(src, "prefer-hardware", (f) => {
+    const v = rect ? new VideoFrame(f, { visibleRect: rect, timestamp: f.timestamp }) : f;
+    enc.encode(v, { keyFrame: f.timestamp === 0 });
+    if (v !== f) v.close();
+    f.close();
+  });
+  await enc.flush(); enc.close();
+  out.err = out.err || err;
+  return out;
+}
+(async () => {
+  try {
+    const [senc, src] = encoder("prefer-software");
+    for (let i = 0; i < N; i++) { paint(i); const f = new VideoFrame(c, { timestamp: i * US }); senc.encode(f, { keyFrame: i === 0 }); f.close(); }
+    await senc.flush(); senc.close();
+    report("source (software decode)", ...await codes(src, "prefer-software"));
+    // Several rounds: a new decoder reuses surface ids, so a stale picture shows an old frame.
+    for (let r = 0; r < 3; r++) report(`decode round ${r}`, ...await codes(src, "prefer-hardware"));
+    const [henc, hout] = encoder("prefer-hardware");
+    for (let i = 0; i < N; i++) { paint(i); const f = new VideoFrame(c, { timestamp: i * US }); henc.encode(f, { keyFrame: i === 0 }); f.close(); }
+    await henc.flush(); henc.close();
+    report("canvas -> encode", ...await codes(hout, "prefer-software"));
+    report("decode -> encode", ...await codes(await transcode(src, null), "prefer-software"));
+    for (const rect of [{ x: 160, y: 90, width: 960, height: 540 }, { x: 0, y: 0, width: 640, height: 360 }]) {
+      report(`decode -> crop ${rect.width}x${rect.height}@${rect.x},${rect.y} -> encode`, ...await codes(await transcode(src, rect), "prefer-software", rect));
+    }
+  } catch (e) { log("CASE exception FAIL", String(e)); }
+  log("DONE");
+})();
+</script>

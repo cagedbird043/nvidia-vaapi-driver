@@ -11,7 +11,9 @@
   没有拷贝的等待方（`vaSyncSurface`、`vaQuerySurfaceStatus`、编码 / VideoProc 的输入依赖）第一次等待时请 worker 确认该帧。
   worker 最多领先 4 帧未确认，同一 surface 再次解码或释放前先确认。回归：`tests/fault.py`。
 - surface 可以在解码前导出；导出的显存在 surface 生命周期内固定，每次解码后由 GPU copy engine 更新。显示路径没有 CPU 拷贝，
-  有一次 GPU 拷贝。
+  有一次 GPU 拷贝。已导出 surface 的 `vaEndPicture` 等这次拷贝完成才返回：Chrome 只在导出时调一次 `vaSyncSurface`，
+  之后直接读 dma-buf，而 NVIDIA 的 GL 不等 dma-buf 上的隐式 fence；不等的话 Chrome 会显示旧画面（回归：`tests/chrome.py`）。
+  拷贝先等 dma-buf 上已有的读者 fence，不覆盖仍在读的画面。帧的失败状态仍在 `vaSyncSurface` 报告。
 - 解码 context 销毁后，存活的 surface 仍持有 worker 和画面。
 - `src/backend/mod.rs` 管会话、导出和下载；`src/backend/{h264,hevc,vp9,av1,mpeg2,mpeg4,vc1,vp8}.rs` 各自把 VA 参数转换成 RM 的描述符输入。
 

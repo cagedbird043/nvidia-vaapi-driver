@@ -20,7 +20,7 @@ use std::{
     collections::HashMap,
     mem::size_of,
     ops::Range,
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
 };
 
 /// Pitch granularity of a LINEAR copy-engine target.
@@ -293,13 +293,17 @@ impl Decoder {
         Ok(())
     }
 
-    /// Copy decoded pixels into the surface's stable externally shared storage.
-    /// The copy engine preserves block-linear layout; no pixels cross the CPU.
-    pub fn copy_into(&mut self, target: u32, output: &Export) -> Result<(), String> {
+    /// Queues the copy of the decoded pixels into the surface's stable externally shared storage
+    /// and returns its fence (None: nothing left to wait for). The copy engine preserves the
+    /// block-linear layout; no pixels cross the CPU. The copy first waits for the readers of the
+    /// previous content (their fences on the dma-buf). The picture's engine status is not checked
+    /// here; see [`Decoder::finish`].
+    pub fn copy_into(&mut self, target: u32, output: &Export) -> Result<Option<OwnedFd>, String> {
         let id = *self
             .pictures
             .get(&target)
             .ok_or("surface has not been decoded")?;
+        let readers = dmabuf_fence(&output.fds[0])?;
         let raw = |i: usize| output.fds.get(i).map_or(-1, |fd| fd.as_raw_fd());
         let target = Target {
             dmabuf_fd: [raw(0), raw(1), raw(2)],
@@ -309,11 +313,9 @@ impl Decoder {
             format: self.format.target(),
             width: self.width,
             height: self.height,
-            acquire_fence_fd: -1,
+            acquire_fence_fd: readers.as_ref().map_or(-1, |f| f.as_raw_fd()),
         };
-        self.session
-            .copy_out_wait(id, &target)
-            .map_err(|e| e.to_string())
+        self.session.copy_out_deferred(id, &target).map_err(|e| e.to_string())
     }
     /// Copies the `rect` of the picture into `dest`, laid out as [`Format::packed`] for the rect's
     /// size: the luma plane, then the interleaved CbCr plane (4:2:0) or the Cb and Cr planes
@@ -384,5 +386,58 @@ impl Decoder {
             let _ = self.session.release(id);
         }
         self.front.release(target);
+    }
+}
+
+extern "C" {
+    #[link_name = "ioctl"]
+    fn libc_ioctl(fd: i32, request: u64, ...) -> i32;
+}
+/// `struct dma_buf_export_sync_file` (linux/dma-buf.h).
+#[repr(C)]
+struct DmaBufSyncFile {
+    flags: u32,
+    fd: i32,
+}
+const DMA_BUF_SYNC_WRITE: u32 = 2;
+/// _IOWR('b', 2, struct dma_buf_export_sync_file)
+const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 = 0xc008_6202;
+
+/// The fences a writer of `buf` has to wait for (every reader and writer), or None when the
+/// buffer is idle.
+fn dmabuf_fence(buf: &OwnedFd) -> Result<Option<OwnedFd>, String> {
+    let mut arg = DmaBufSyncFile { flags: DMA_BUF_SYNC_WRITE, fd: -1 };
+    // SAFETY: valid dma-buf fd and argument struct of the ioctl's layout.
+    if unsafe { libc_ioctl(buf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut arg) } != 0 {
+        return Err(format!("DMA_BUF_IOCTL_EXPORT_SYNC_FILE: {}", std::io::Error::last_os_error()));
+    }
+    // SAFETY: the kernel returned a new sync_file fd that we now own.
+    Ok((arg.fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(arg.fd) }))
+}
+
+extern "C" {
+    #[link_name = "poll"]
+    fn libc_poll(fds: *mut PollFd, n: u64, timeout_ms: i32) -> i32;
+}
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+/// Waits until the sync_file `fence` signals, at most 5 s.
+pub fn wait_fence(fence: &OwnedFd) -> Result<(), String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        let mut p = PollFd { fd: fence.as_raw_fd(), events: 1, revents: 0 }; // POLLIN
+        // SAFETY: one valid pollfd.
+        match unsafe { libc_poll(&mut p, 1, left.as_millis() as i32) } {
+            1 => return Ok(()),
+            0 => return Err("copy fence timed out".into()),
+            _ if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => continue,
+            _ => return Err(format!("poll on copy fence: {}", std::io::Error::last_os_error())),
+        }
     }
 }

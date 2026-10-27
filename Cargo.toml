@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Local development overrides this with a path [patch] in .cargo/config.toml (not committed).
-nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "88038d47b91210e59ee469e9abebf381c420015d", default-features = false }
+nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "fbfe3d384e27e5621473096e5e27764336094a67", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72"

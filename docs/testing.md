@@ -14,6 +14,7 @@
 | `tests/gstreamer.py` | GStreamer `va` 元素解码六种格式、编码三种格式、`vapostproc` 缩放与变格式（需要 `GST_VA_ALL_DRIVERS=1`，脚本已设置） |
 | `tests/vpp.py` | VideoProc：直接 VA 客户端 `tests/vpp_probe.c` 的像素级单项与 ffmpeg `scale_vaapi` 对照（`--only probe` / `--only ffmpeg`） |
 | `tests/fault.py` | 解码状态失败注入：坏帧不交给读回、编码与同步；`--stress` 加长跑、并发 4 进程、中途中断 |
+| `tests/chrome.py` | Chrome WebCodecs：硬解、硬编、硬解直送硬编（含裁剪）的每一帧按画面里的帧号校验，不能是旧帧或错帧；`--driver-dir system` 测已安装驱动 |
 
 `cargo test --release` 只跑无需 GPU 的单元测试。
 
@@ -294,6 +295,17 @@ python3 tests/fault.py --stress
 | HEVC 1080p → H.264、HEVC 4K → AV1 | 501 / 184 fps | 500 / 184 fps | 持平（编码同步提交是瓶颈） |
 
 CPU 时间不变或略降（读回 1.35 → 1.18 s）。读回的内容与旧版、软解逐帧一致（H.264 / HEVC / AV1 / VP9）。
+
+## Chrome WebCodecs 帧序
+
+```sh
+python3 tests/chrome.py
+```
+
+Chrome 只在导出 surface 时调一次 `vaSyncSurface`，之后直接用 NVIDIA 的 GL 读导出的 dma-buf，GL 不等隐式 fence。0.2.0 的 `vaEndPicture` 只把导出拷贝排进队列，
+新解码器复用 surface id 时偶尔读到上一轮留下的画面（第 2、3 轮硬解各有 1–3 帧是错帧）；改为已导出 surface 的 `vaEndPicture` 等拷贝完成后
+8 项全部通过（每项 60 帧、帧号全对），3 轮硬解、硬解直送硬编、两种裁剪都没有错帧。页面画面经 Chrome 的 GL 转换后与参考图只有约 25 dB
+（AMD 780M + radeonsi 相同），所以用帧号而不是 PSNR 判断。
 
 ## 环境变量与其余回归
 

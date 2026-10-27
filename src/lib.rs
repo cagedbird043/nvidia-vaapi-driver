@@ -398,7 +398,11 @@ impl Worker {
                         // The copy is ordered after the decode on the GPU and checks the picture
                         // once it completed; the decode's own confirmation then needs no wait.
                         Command::Copy(id, output, done) => {
-                            done.finish(gpu(decoder.copy_into(id, &output)));
+                            let result = decoder
+                                .copy_into(id, &output)
+                                .and_then(|fence| fence.map_or(Ok(()), |f| backend::wait_fence(&f)))
+                                .and_then(|()| decoder.finish(id));
+                            done.finish(gpu(result));
                             confirm(&mut decoder, &mut unconfirmed, Some(id));
                         }
                         Command::Readback(id, rect, dest, reply) => {
@@ -660,7 +664,10 @@ impl Driver {
         }
         self.update_output(id)
     }
-    /// Queues the copy into the exported backing after the latest decode; vaSyncSurface waits for it.
+    /// Queues the copy into the exported backing after the latest decode and waits for it.
+    /// Importers may never call vaSyncSurface again (Chrome syncs once, at export) and the NVIDIA
+    /// GL driver ignores the dma-buf's implicit fences, so the picture has to be in the backing
+    /// when vaEndPicture returns. A failed picture still reports at vaSyncSurface.
     fn update_output(&mut self, id: u32) -> R {
         let s = self.surfaces.get_mut(&id).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;
         if s.decode.is_none() || !s.output_dirty {
@@ -671,7 +678,9 @@ impl Driver {
         };
         let output = gpu(output.try_clone())?;
         let worker = s.worker.as_ref().ok_or(FAILED)?;
-        s.copy = Some(worker.queue(|done| Command::Copy(id, output, done)));
+        let copy = worker.queue(|done| Command::Copy(id, output, done));
+        let _ = copy.wait();
+        s.copy = Some(copy);
         s.output_dirty = false;
         Ok(())
     }
