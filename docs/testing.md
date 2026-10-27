@@ -207,13 +207,24 @@ C 版作为对照有自己的失败（只记录，不影响退出码）：AV1 �
 |---|---|---|
 | NV12 线性 / 块线性 import，与 `vaPutImage` 码流逐字节一致 | 是（H.264、HEVC；块线性 `…6011`–`…6015` 全部） | 是 |
 | P010 import（HEVC Main10） | 是 | `vaCreateSurfaces` 失败 |
-| BGRA import | 是（线性与块线性码流相同；对 BT.709 参考 PSNR 约 38.6 dB） | `vaEndPicture` 失败（本测试程序下） |
+| BGRA import | 是（线性与块线性码流相同；对 BT.709 参考 PSNR 约 38.6 dB；GPU 转换与 CPU 转换的码流逐字节一致） | `vaEndPicture` 失败（本测试程序下） |
 | 444P / Q416 线性 / 块线性 import（H.264 444、HEVC Main444、Main444_10），与 `vaPutImage` 码流逐字节一致 | 是（656×368、642×362、1280×720、1920×1080） | 未测 |
 | 解码 surface 直接编码（HEVC Main10、AV1 10-bit、HEVC 444 8-bit），与同一解码 `hwupload` 码流逐字节一致 | 是 | 未测 |
 | 解码 → 编码 CPU 回读 | 无 | 无 |
 | 解码 surface 导出再 DRM_PRIME_2 导入编码 | 与直接转码逐字节一致 | 未测 |
 
 1080p 3000 帧 H.264 硬转码耗时：rustnv 6.0 s，C 版 7.0 s；600 帧 user CPU：rustnv 0.25 s，C 版 0.26 s。12000 帧 RSS 150 → 161 MiB 后持平。
+
+BGRA 外部 dma-buf 编码（H.264，300 帧，同一帧只上传一次，`IMP_STATIC=1 tests/dmabuf_import.c`，计时整个进程）：
+
+| 尺寸 / 源布局 | GPU 转换：耗时 / user CPU | CPU 转换（0.1.0）：耗时 / user CPU |
+|---|---|---|
+| 1920×1080 线性 | 0.94 s / 0.05 s | 1.66 s / 1.30 s |
+| 1920×1080 块线性 | 0.95 s / 0.04 s | 1.75 s / 1.33 s |
+| 3840×2160 线性 | 2.48 s / 0.07 s | 5.21 s / 4.74 s |
+| 3840×2160 块线性 | 2.65 s / 0.07 s | 5.21 s / 4.69 s |
+
+两种转换的输出码流逐字节一致。RM 的实机测试 `bgra_to_nv12_matches_cpu` 直接比对 NVENC 输入槽：极值、纯色、色度棋盘格、随机图（X 字节为垃圾值），1×1 到 1920×1080 的奇偶尺寸，线性（含带 padding 的 pitch）与块线性源，180 组逐字节一致。
 
 测试：`tests/encode.py` 的 `zero_copy` 编译 `tests/dmabuf_import.c`（Vulkan 分配外部 NV12/P010/444P/Q416/BGRA，线性与块线性）与 `tests/dmabuf_export.c`（libav VA-API 解码后导出再导入），逐字节对照同内容 `vaPutImage`、BGRA PSNR 门限、1000 次循环 RSS/fd。FFmpeg 的 VA-API 解码没有 Q416 像素格式（10-bit 4:4:4 硬解在 `vaBeginPicture` 即失败），Q416 解码 surface 的布局由 Q416 import 覆盖。RM 的实机测试 `cargo test --release --lib chroma_444_interleave -- --ignored` 直接比对 4:4:4 色度交错的 copy engine 输出与 CPU tiler。
 

@@ -59,7 +59,7 @@ C 版的 JPEG Baseline 经 libnvcuvid 的 JPEG 路径解码；nvrm 追踪显示 
 - 8-bit 444P 直接交给 RM 做 tiled chroma interleave。Q416 使用每个 context 复用的 chroma staging 缓冲，将两个 16-bit 平面交错后上传；luma 不做 staging 拷贝。
 - H.264 / HEVC 忽略应用 packed SPS/PPS/slice，使用 RM 生成的参数集，在每个 IDR 前重复。AV1 接受 packed sequence 参数，RM 输出 in-band sequence OBU。
 - coded buffer map 返回 `VACodedBufferSegment`（单段链、`VA_CODED_BUF_STATUS_SINGLE_NALU`）。提交当前为同步编码，因此 surface / buffer 同步查询在提交返回后已完成。
-- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface（8/10-bit 4:2:0、444P / Q416）作编码输入不经 CPU：surface 的导出 backing（8 行 GOB、单 GOB 块高的块线性）由 GPU copy engine 重排进 NVENC 输入槽，字节与 CPU tiler 一致。4:4:4 的 Cb、Cr 两个平面各用一次 remap 拷贝写进交错 chroma 的偶数 / 奇数分量，另一分量设为 NO_WRITE 保留原值（RM 实机测试 `chroma_444_interleave` 覆盖 1 / 2 字节样本、线性与块线性源、跨 GOB 尺寸与带 padding 的 pitch，结果与 CPU tiler 逐字节一致）。外部 DMA-BUF 的 NV12 / P010 / 444P / Q416 同走 copy engine；BGRA 先经 copy engine 拷入系统内存 staging，再由 CPU 按 BT.709 转换（见“已知限制”）。
+- GPU 从 libva 的 DRM fd 选择，与解码一致。解码 surface（8/10-bit 4:2:0、444P / Q416）作编码输入不经 CPU：surface 的导出 backing（8 行 GOB、单 GOB 块高的块线性）由 GPU copy engine 重排进 NVENC 输入槽，字节与 CPU tiler 一致。4:4:4 的 Cb、Cr 两个平面各用一次 remap 拷贝写进交错 chroma 的偶数 / 奇数分量，另一分量设为 NO_WRITE 保留原值（RM 实机测试 `chroma_444_interleave` 覆盖 1 / 2 字节样本、线性与块线性源、跨 GOB 尺寸与带 padding 的 pitch，结果与 CPU tiler 逐字节一致）。外部 DMA-BUF 的 NV12 / P010 / 444P / Q416 同走 copy engine。BGRA（ARGB / XRGB）由 copy engine 拷进显存线性 scratch，RM 的 compute 内核 `bgra_nv12` 按 BT.709 video range 转成线性 NV12（与 CPU 转换同一套定点系数与取整，逐字节一致），再由 copy engine 写进输入槽；只在已实测的 GPU（Ada）上启用，其余 GPU 回退到系统内存 staging + CPU 转换。
 - RM 的帧率接口为整数，分数帧率四舍五入。RateControl / FrameRate misc 参数被消费；其余 misc（包含 HRD / QualityLevel）与当前 C 后端一样接受但不消费。
 
 FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由回归脚本里的直接 VA 客户端测试，并检查输出色度/位深。
@@ -70,7 +70,7 @@ FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由�
 |---|---|
 | 解码 surface | 导出 backing → GPU copy engine（块线性 → NVENC 输入 tile）→ 输入槽 |
 | DRM_PRIME_2 / DRM_PRIME（NV12、P010/P012/P016、444P、Q416） | 导入 dma-buf → copy engine → 输入槽（4:4:4 色度两次 remap 交错） |
-| DRM_PRIME_2 / DRM_PRIME（ARGB、XRGB） | 导入 → copy engine → 系统内存 staging → CPU BT.709 转换 → 输入槽 |
+| DRM_PRIME_2 / DRM_PRIME（ARGB、XRGB） | 导入 → copy engine → 显存 scratch → compute 内核 BT.709 → copy engine → 输入槽（未实测的 GPU：系统内存 staging + CPU 转换） |
 | `vaPutImage` / `vaDeriveImage` | CPU 写显存 |
 
 - `vaCreateSurfaces` 接受 `VASurfaceAttribMemoryType` = VA | DRM_PRIME | DRM_PRIME_2 与 `VASurfaceAttribExternalBufferDescriptor`（每次一个 surface）。旧版 DRM_PRIME 不带修饰符，与 C 版一样只在设置 `NVD_DRM_PRIME_ASSUME_LINEAR` 时按线性接受；`vaQuerySurfaceAttributes` 也只在此时报告它，平时报告 VA | DRM_PRIME_2 和外部缓冲描述符。
@@ -94,7 +94,7 @@ C 版 nvidia-vaapi-driver 看似能在默认设置下工作，是因为它加载
 ## 已知限制
 
 - 不支持 JPEG（见上）和 VideoProc（`VAProfileNone` + `VAEntrypointVideoProc`；缩放、变格式、滤镜均不可用，ffmpeg 的 `scale_vaapi` 因此不能用）。
-- BGRA 色彩转换在 CPU：RM 没有计算通道，copy engine 只能搬运。
+- BGRA 的 GPU 转换只在实测过的 Ada（compute class `0xc9c0`）上启用；其他架构的内核随 RM 生成、QMD 打包有单测，但不在硬件上运行，回退到 CPU 转换。
 - 同步在 CPU 侧：解码完成与 copy engine 完成都由 CPU 等待，未做 GPU 侧 fence 串联。
 - 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。
 - 编码为同步提交，单个 L0 参考、I/P 帧。

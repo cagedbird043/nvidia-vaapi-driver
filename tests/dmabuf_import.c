@@ -181,7 +181,7 @@ int main(int argc,char **argv){
             free(yb);free(uvb);
             CHECK(vaUnmapBuffer(d,im.buf));CHECK(vaPutImage(d,base,im.image_id,0,0,w,h,0,0,w,h));
         }else{
-            vk_upload(&vk,n);
+            if(n==0||!getenv("IMP_STATIC"))vk_upload(&vk,n); // IMP_STATIC: time the driver, not the upload
             int dup_fd=dup(vk.fd);surface=import_surface(d,&vk,dup_fd);close(dup_fd);
         }
         VABufferID pic,slice;
