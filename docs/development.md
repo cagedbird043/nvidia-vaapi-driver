@@ -43,7 +43,7 @@ nv-bionic-native = { path = "/path/to/nvrm" }
 
 ### Cargo.lock 注意事项
 
-启用 `[patch]` 后，cargo 会去掉 `Cargo.lock` 里 nvrm 条目的 `source` 行，`git status` 里 `Cargo.lock` 显示已修改。**不要提交这个改动**：提交前 `git checkout Cargo.lock`，或临时移走 `.cargo/config.toml` 后重新生成。CI 与打包使用 `--locked`，依赖提交进仓库的锁文件。
+启用 `[patch]` 后，cargo 会去掉 `Cargo.lock` 里 nvrm 条目的 `source` 行，`git status` 里 `Cargo.lock` 显示已修改。**不要提交这个改动**：提交前 `git checkout Cargo.lock`，或临时移走 `.cargo/config.toml` 后重新生成。打包使用 `--locked`，依赖提交进仓库的锁文件。
 
 ## 打包
 
