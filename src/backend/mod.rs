@@ -268,7 +268,8 @@ impl Decoder {
             format,
         })
     }
-    /// Decodes one picture into `picture.target` and waits for the hardware; runs on the worker.
+    /// Submits one picture into `picture.target`; runs on the worker. The engine status is
+    /// confirmed later by [`Decoder::finish`] or by a copy of the picture.
     pub fn decode(&mut self, picture: &Picture) -> Result<(), String> {
         let bits = self.front.stage(picture)?;
         let target = picture.target;
@@ -283,6 +284,11 @@ impl Decoder {
             .next_picture()
             .ok_or("RM session produced no picture")?;
         self.pictures.insert(target, id);
+        Ok(())
+    }
+    /// Waits for the decode of `target` and checks its engine status.
+    pub fn finish(&mut self, target: u32) -> Result<(), String> {
+        let id = *self.pictures.get(&target).ok_or("surface has not been decoded")?;
         self.session.wait_picture(id).map_err(|e| e.to_string())?;
         Ok(())
     }

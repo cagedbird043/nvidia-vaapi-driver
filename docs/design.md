@@ -6,6 +6,10 @@
 
 - 每个 context 一个 worker 线程持有 RM 会话；VA 回调把解码和导出拷贝排进队列后返回，`vaSyncSurface`、`vaDeriveImage`、
   `vaGetImage` 不持全局锁等待完成。worker 退出时未完成的工作置为失败，等待方不会卡死。
+- 解码只提交，不在 worker 上等。导出拷贝、读回由 copy engine 在 GPU 上 acquire 解码的 timeline，排在解码之后（RM 报告 native 64 位 timeline 时；否则 RM 在提交拷贝前 CPU 等待解码）；
+  拷贝完成后再检查该帧的引擎状态（AV1 与旧格式的 `error_status`），失败的帧让拷贝、读回、`vaSyncSurface` 与编码输入都返回错误。
+  没有拷贝的等待方（`vaSyncSurface`、`vaQuerySurfaceStatus`、编码 / VideoProc 的输入依赖）第一次等待时请 worker 确认该帧。
+  worker 最多领先 4 帧未确认，同一 surface 再次解码或释放前先确认。回归：`tests/fault.py`。
 - surface 可以在解码前导出；导出的显存在 surface 生命周期内固定，每次解码后由 GPU copy engine 更新。显示路径没有 CPU 拷贝，
   有一次 GPU 拷贝。
 - 解码 context 销毁后，存活的 surface 仍持有 worker 和画面。
@@ -109,7 +113,7 @@ C 版 nvidia-vaapi-driver 看似能在默认设置下工作，是因为它加载
 
 - 不支持 JPEG（见上）。VideoProc 没有滤镜，跨色域与 HDR → SDR 不做；Turing / Ampere / Hopper / Blackwell 的 `vpp` 内核随 RM 生成，但未在硬件上运行，这些 GPU 不报告 VideoProc。
 - BGRA 的 GPU 转换只在实测过的 Ada（compute class `0xc9c0`）上启用；其他架构的内核随 RM 生成、QMD 打包有单测，但不在硬件上运行，回退到 CPU 转换。
-- 同步在 CPU 侧：解码完成与 copy engine 完成都由 CPU 等待，未做 GPU 侧 fence 串联。
+- 等待在 CPU 侧：消费者等 copy engine 的 fence，NVDEC 与 copy engine 之间由 GPU timeline 串联；编码输入、导入的 dma-buf 不带 fence，外部生产者写完后由 CPU 侧同步保证。
 - 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。
 - 编码为同步提交，单个 L0 参考、I/P 帧。
 - Chrome 需要 `--disable-gpu-sandbox` 与 `--render-node-override`。

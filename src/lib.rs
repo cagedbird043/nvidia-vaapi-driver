@@ -235,13 +235,19 @@ struct Frame {
 struct Completion {
     result: Mutex<Option<R>>,
     ready: Condvar,
+    /// Asks the producer to settle the work now; taken by the first wait or poll that finds the
+    /// result missing (a decode whose engine status the worker confirms on demand).
+    nudge: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 impl Completion {
     fn new() -> Arc<Self> {
-        Arc::new(Self { result: Mutex::new(None), ready: Condvar::new() })
+        Arc::new(Self { result: Mutex::new(None), ready: Condvar::new(), nudge: Mutex::new(None) })
+    }
+    fn with_nudge(nudge: Box<dyn FnOnce() + Send>) -> Arc<Self> {
+        Arc::new(Self { result: Mutex::new(None), ready: Condvar::new(), nudge: Mutex::new(Some(nudge)) })
     }
     fn done(result: R) -> Arc<Self> {
-        Arc::new(Self { result: Mutex::new(Some(result)), ready: Condvar::new() })
+        Arc::new(Self { result: Mutex::new(Some(result)), ready: Condvar::new(), nudge: Mutex::new(None) })
     }
     fn set(&self, result: R) {
         if let Ok(mut slot) = self.result.lock() {
@@ -249,11 +255,22 @@ impl Completion {
             self.ready.notify_all();
         }
     }
+    fn nudge(&self) {
+        if self.result.lock().map_or(true, |r| r.is_some()) {
+            return;
+        }
+        let nudge = self.nudge.lock().ok().and_then(|mut n| n.take());
+        if let Some(nudge) = nudge {
+            nudge();
+        }
+    }
     fn poll(&self) -> Option<R> {
+        self.nudge();
         *self.result.lock().ok()?
     }
     /// Like `wait`, but gives up after `timeout`: `None` if the work is still running.
     fn wait_timeout(&self, timeout: std::time::Duration) -> Option<R> {
+        self.nudge();
         let deadline = std::time::Instant::now().checked_add(timeout);
         let mut slot = self.result.lock().ok()?;
         loop {
@@ -271,6 +288,7 @@ impl Completion {
         }
     }
     fn wait(&self) -> R {
+        self.nudge();
         let mut slot = self.result.lock().map_err(|_| FAILED)?;
         loop {
             if let Some(result) = *slot {
@@ -303,8 +321,12 @@ enum Command {
     Copy(u32, backend::Export, Pending),
     Readback(u32, backend::Rect, Destination, mpsc::Sender<Result<(), String>>),
     Release(u32),
+    /// A waiter needs the decode of this target settled.
+    Confirm(u32),
     Quit,
 }
+/// Decodes a worker submits ahead of their status confirmation (NVDEC runs them in order).
+const MAX_UNCONFIRMED: usize = 4;
 /// Owns one context's RM decoder; executes commands in submission order, so a picture's decode
 /// precedes its copies, read-backs and release, and references precede the pictures using them.
 struct Worker {
@@ -334,27 +356,66 @@ impl Worker {
                         return;
                     }
                 };
-                while let Ok(cmd) = rx.recv() {
+                // Decodes whose engine status is not confirmed yet, in submission order. A decode
+                // is only submitted; its Completion finishes once the picture is checked, so further
+                // decodes and the copies after it queue on the GPU without a CPU wait in between.
+                let mut unconfirmed: Vec<(u32, Pending)> = Vec::new();
+                // Confirm the oldest decodes up to and including `target`'s (all with None).
+                let confirm = |decoder: &mut backend::Decoder, unconfirmed: &mut Vec<(u32, Pending)>, target: Option<u32>| {
+                    let n = match target {
+                        Some(t) => match unconfirmed.iter().position(|(u, _)| *u == t) {
+                            Some(i) => i + 1,
+                            None => return,
+                        },
+                        None => unconfirmed.len(),
+                    };
+                    for (target, done) in unconfirmed.drain(..n) {
+                        done.finish(decoder.finish(target).map_err(|e| {
+                            eprintln!("rustnv: {e}");
+                            VA_STATUS_ERROR_DECODING_ERROR as VAStatus
+                        }));
+                    }
+                };
+                loop {
+                    let Ok(cmd) = rx.recv() else { break };
                     match cmd {
                         Command::Decode(picture, done) => {
-                            let result = decoder.decode(&picture);
-                            done.finish(result.map_err(|e| {
-                                eprintln!("rustnv: {e}");
-                                VA_STATUS_ERROR_DECODING_ERROR as VAStatus
-                            }));
+                            // Decoding into the target again replaces its picture.
+                            confirm(&mut decoder, &mut unconfirmed, Some(picture.target));
+                            match decoder.decode(&picture) {
+                                Ok(()) => unconfirmed.push((picture.target, done)),
+                                Err(e) => {
+                                    eprintln!("rustnv: {e}");
+                                    done.finish(Err(VA_STATUS_ERROR_DECODING_ERROR as VAStatus));
+                                }
+                            }
+                            // Bound the decodes in flight ahead of their confirmation.
+                            if unconfirmed.len() > MAX_UNCONFIRMED {
+                                let oldest = unconfirmed[0].0;
+                                confirm(&mut decoder, &mut unconfirmed, Some(oldest));
+                            }
                         }
+                        // The copy is ordered after the decode on the GPU and checks the picture
+                        // once it completed; the decode's own confirmation then needs no wait.
                         Command::Copy(id, output, done) => {
                             done.finish(gpu(decoder.copy_into(id, &output)));
+                            confirm(&mut decoder, &mut unconfirmed, Some(id));
                         }
                         Command::Readback(id, rect, dest, reply) => {
                             // SAFETY: `Destination` documents the caller keeps the range valid.
                             let dest = unsafe { std::slice::from_raw_parts_mut(dest.0, dest.1) };
                             let _ = reply.send(decoder.readback(id, rect, dest));
+                            confirm(&mut decoder, &mut unconfirmed, Some(id));
                         }
-                        Command::Release(id) => decoder.release_surface(id),
+                        Command::Release(id) => {
+                            confirm(&mut decoder, &mut unconfirmed, Some(id));
+                            decoder.release_surface(id);
+                        }
+                        Command::Confirm(id) => confirm(&mut decoder, &mut unconfirmed, Some(id)),
                         Command::Quit => break,
                     }
                 }
+                confirm(&mut decoder, &mut unconfirmed, None);
             })
             .map_err(|_| FAILED)?;
         match ready_rx.recv() {
@@ -370,6 +431,16 @@ impl Worker {
                 }
             }
         }
+    }
+    /// Queues the decode of `picture`. The worker only submits it; the first wait on the returned
+    /// Completion asks the worker to confirm the picture's engine status.
+    fn decode(&self, picture: backend::Picture) -> Arc<Completion> {
+        let (tx, target) = (self.tx.clone(), picture.target);
+        let done = Completion::with_nudge(Box::new(move || {
+            let _ = tx.send(Command::Confirm(target));
+        }));
+        let _ = self.tx.send(Command::Decode(picture, Pending(done.clone())));
+        done
     }
     /// Queues work whose outcome is reported through the returned Completion.
     fn queue(&self, command: impl FnOnce(Pending) -> Command) -> Arc<Completion> {
@@ -1132,7 +1203,7 @@ callback!(end_picture(ctx, id: u32) |d| {
     let mut f = c.frame.take().ok_or(INVALID)?;
     let (worker, target, vp8) = (c.worker.clone(), f.target, c.codec == backend::Codec::Vp8);
     let (decode, status) = match prepare(&mut f, vp8) {
-        Ok(picture) => (worker.queue(move |done| Command::Decode(picture, done)), Ok(())),
+        Ok(picture) => (worker.decode(picture), Ok(())),
         Err(e) => (Completion::done(Err(e)), Err(e)),
     };
     let s = d.surfaces.get_mut(&target).ok_or(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus)?;

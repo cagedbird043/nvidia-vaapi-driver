@@ -13,6 +13,7 @@
 | `tests/env.py` | 环境变量与兼容行为 |
 | `tests/gstreamer.py` | GStreamer `va` 元素解码六种格式、编码三种格式、`vapostproc` 缩放与变格式（需要 `GST_VA_ALL_DRIVERS=1`，脚本已设置） |
 | `tests/vpp.py` | VideoProc：直接 VA 客户端 `tests/vpp_probe.c` 的像素级单项与 ffmpeg `scale_vaapi` 对照（`--only probe` / `--only ffmpeg`） |
+| `tests/fault.py` | 解码状态失败注入：坏帧不交给读回、编码与同步；`--stress` 加长跑、并发 4 进程、中途中断 |
 
 `cargo test --release` 只跑无需 GPU 的单元测试。
 
@@ -272,6 +273,27 @@ GStreamer `vapostproc`（两级：VA surface 上处理，再读回）对照 zsca
 RM 的实机测试 `cargo test --release --lib vpp -- --ignored` 覆盖每种格式的 copy engine 拷贝、内核与 CPU 参考（32 种组合 × 5 种几何，误差 ≤ 1）和单位变换逐字节一致。
 
 Chrome 156（Linux）只在 native 输入（GpuMemoryBuffer）且 `source_rect != encode_size` 时调用 `BlitSurface()`。实测未能触发：WebCodecs 在 Linux 上 `IsGpuFrameResizeSupported()` 为 false，裁剪 / 缩放在 renderer 里做；WebRTC 加 `--video-capture-use-gpu-memory-buffer`（假摄像头）后 VEA 仍以 I420 + SharedMemory 初始化；空间层 SVC 只支持 VP9，NVENC 没有 VP9 编码。
+
+## 解码状态的延迟检查
+
+```sh
+python3 tests/fault.py --stress
+```
+
+失败注入：AV1 片段第 13–20 帧的 tile 数据中段改成随机字节（OBU 语法完整，引擎报 `error_status 0xd`）。读回（`hwdownload`，经 `vaSyncSurface`）与编码输入两条路径交出的每一帧都与干净码流同 pts 的帧逐字节一致，坏帧一帧也不交出，ffmpeg 报错；只解码时不挂死。压力：24000 帧解码 + 读回的峰值 RSS 比 10800 帧只多约 4 MB（ffmpeg 自身前一万帧内也涨约 20 MB）；4 个进程同时转码全部成功；20 次在解码中途 SIGINT / SIGKILL，无挂死，之后的解码正常。
+
+性能（1080p 片段 1200 帧，4K 为 HEVC 600 帧；ffmpeg 输出留在 GPU，读回为 `hwdownload,format=nv12`；前后两版交替各跑 4–8 轮取最快）：
+
+| 用例 | 解码后 CPU 等待 | 延迟检查 | 变化 |
+|---|---:|---:|---:|
+| H.264 / HEVC / AV1 1080p 解码 | 751 / 1683 / 1803 fps | 804 / 1893 / 2016 fps | +7% / +12% / +12% |
+| HEVC 4K 解码 | 465 fps | 491 fps | +6% |
+| H.264 / HEVC / AV1 1080p 解码 + 读回 | 435 / 704 / 696 fps | 776 / 905 / 926 fps | +79% / +28% / +33% |
+| HEVC 4K 解码 + 读回 | 193 fps | 216 fps | +12% |
+| H.264 1080p → AV1 | 490 fps | 607 fps | +24% |
+| HEVC 1080p → H.264、HEVC 4K → AV1 | 501 / 184 fps | 500 / 184 fps | 持平（编码同步提交是瓶颈） |
+
+CPU 时间不变或略降（读回 1.35 → 1.18 s）。读回的内容与旧版、软解逐帧一致（H.264 / HEVC / AV1 / VP9）。
 
 ## 环境变量与其余回归
 

@@ -108,7 +108,7 @@ GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264d
 - Chrome 需要 `--disable-gpu-sandbox` 与 `--render-node-override`：默认沙箱下 Chrome 重新打开 VA display 被其 broker 拒绝，驱动无法绕过。
 - 4:2:2 解码、VP9 / AV1 4:4:4、AV1 12-bit、H.264 隔行与 FMO 等 NVDEC 不支持的情形会返回错误。
 - BGRA 输入的 GPU 色彩转换只在实测过的 Ada 上启用，其他架构回退到 CPU 转换。
-- 视频帧同步在 CPU 侧完成，编码提交为同步。
+- 消费者在 CPU 上等待完成（解码与导出拷贝之间在 GPU 上串联），编码提交为同步。
 
 完整列表见 [docs/design.md](docs/design.md)。
 
@@ -224,7 +224,7 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 - Chrome needs `--disable-gpu-sandbox` and `--render-node-override`.
 - Formats NVDEC cannot decode (4:2:2, VP9 / AV1 4:4:4, AV1 12-bit, interlaced H.264, FMO, …) return errors.
 - GPU colour conversion of BGRA encoder input is enabled only on the tested Ada GPU; other architectures fall back to the CPU.
-- Frame synchronisation is CPU-side and encode submission is synchronous.
+- Consumers wait for completion on the CPU (the export copy is ordered after the decode on the GPU); encode submission is synchronous.
 
 ## Performance vs. the C driver
 
