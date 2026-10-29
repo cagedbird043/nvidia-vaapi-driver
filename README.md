@@ -21,7 +21,7 @@
 - 目标：Turing 及更新架构的 NVIDIA GPU，使用 **nvidia-open** 内核模块（专有模块不在测试范围）。
 - 只在 RTX 4060 Laptop（Ada）/ nvidia-open 615.78.08 / x86_64 glibc 上实测。
 - RM 按 NVIDIA 驱动版本精确匹配内核 ABI，不认识的版本会拒绝运行，所以支持的驱动版本取决于所用 nvrm 版本。
-- 0.2.3 钉选 nvrm `5fcba81`，同步 Codec2 Rust 解码驱动及公共视频 ABI 类型更新；本驱动的 VA-API 能力不变。
+- 0.2.4 支持可写导出（`WRITE_ONLY` / `READ_WRITE`），Sunshine 的 VA-API 编码可用；nvrm 仍钉选 `5fcba81`。
 
 ## 安装
 
@@ -174,7 +174,7 @@ Maximum decode size: H.264 / VP8 4096, MPEG-2 4080, MPEG-4 / VC-1 2048, HEVC / V
 - Target: Turing and newer GPUs with the **nvidia-open** kernel modules (the proprietary modules are not tested).
 - Tested only on RTX 4060 Laptop (Ada) / nvidia-open 615.78.08 / x86_64 glibc.
 - RM matches the kernel ABI to the exact NVIDIA driver version and refuses unknown versions, so the supported driver versions depend on the nvrm revision in use.
-- Version 0.2.3 pins nvrm `5fcba81`, synchronizing the Rust Codec2 decoding driver and shared video ABI types; VA-API capabilities are unchanged.
+- Version 0.2.4 adds writable exports (`WRITE_ONLY` / `READ_WRITE`), which Sunshine's VA-API encoder needs; nvrm stays pinned at `5fcba81`.
 
 ## Installation
 
