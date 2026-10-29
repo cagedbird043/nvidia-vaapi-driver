@@ -2,7 +2,7 @@
 
 所有脚本都不安装或修改系统驱动：它们在子进程内用 `LIBVA_DRIVERS_PATH` / `LIBVA_DRIVER_NAME` 选择 rustnv。先 `cargo build --release`；脚本默认加载 `target/release/librustnv_drv_video.so`（`--driver` 可改），默认设备 `/dev/dri/renderD129`（`--device` 可改，用 `vainfo`/`ls /dev/dri` 确认 NVIDIA 的渲染节点）。
 
-脚本需要 Python 3、C 编译器、FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）、`vainfo`；对照 C 版时还需要另行安装的 C 版 `nvidia_drv_video.so`（与本驱动的安装名相同，二者不能同时装在 `/usr/lib/dri`；`tests/encode.py` 的 `--reference-library` 指向放有 C 版 `.so` 的目录，默认取系统驱动目录）。`tests/` 下的 `*.c` 是脚本自动编译的辅助程序（`va_dump.c`、`va_rt420.c`、`dmabuf_egl.c`、`dmabuf_import.c`、`dmabuf_export.c`、`dmabuf_write.c`）。
+脚本需要 Python 3、C 编译器、FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）、`vainfo`；对照 C 版时还需要另行安装的 C 版 `nvidia_drv_video.so`（与本驱动的安装名相同，二者不能同时装在 `/usr/lib/dri`；`tests/encode.py` 的 `--reference-library` 指向放有 C 版 `.so` 的目录，默认取系统驱动目录）。`tests/` 下的 `*.c` 是脚本自动编译的辅助程序（`va_dump.c`、`va_rt420.c`、`dmabuf_egl.c`、`dmabuf_import.c`、`dmabuf_export.c`、`dmabuf_write.c`、`surface_state.c`）。
 
 ## 脚本
 
@@ -15,8 +15,11 @@
 | `tests/vpp.py` | VideoProc：直接 VA 客户端 `tests/vpp_probe.c` 的像素级单项与 ffmpeg `scale_vaapi` 对照（`--only probe` / `--only ffmpeg`） |
 | `tests/fault.py` | 解码状态失败注入：坏帧不交给读回、编码与同步；`--stress` 加长跑、并发 4 进程、中途中断 |
 | `tests/chrome.py` | Chrome WebCodecs：硬解、硬编、硬解直送硬编（含裁剪）的每一帧按画面里的帧号校验，不能是旧帧或错帧；`--driver-dir system` 测已安装驱动 |
+| `tests/state.py` | surface 画面位置的状态转移（`tests/surface_state.c`）：解码、`vaPutImage`、VideoProc 输出、可写导出后的 EGL 写入两两先后发生，`vaGetImage`、`vaDeriveImage` 与 VideoProc 都读到后发生的那个；默认加载 debug 构建 |
 
 `cargo test --release` 只跑无需 GPU 的单元测试。
+
+debug 构建（`cargo build`）在每次 VA 调用后检查 surface 状态不变量（`Surface::violations`：解码、VideoProc 输出、CPU 画面至多其一；可写导出的 surface 有导出显存而无 CPU 画面；导入的 surface 没有自己的画面等），违反即打印 `rustnv: surface N state invariant broken` 并 abort。release 构建不含这项检查。其余脚本也可指向 debug 构建（`--driver` / `--driver-dir` / `--library` 改到 `target/debug`，该目录需有 `rustnv_drv_video.so -> librustnv_drv_video.so` 链接）一起跑出断言。
 
 ## 解码回归
 

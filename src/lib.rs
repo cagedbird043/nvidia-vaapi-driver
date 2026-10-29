@@ -579,6 +579,24 @@ impl Surface {
     fn pending(&self) -> Vec<Arc<Completion>> {
         self.decode.iter().chain(&self.copy).chain(&self.processed).cloned().collect()
     }
+    /// The rules that make the picture's location unambiguous; checked after every call in debug
+    /// builds. The picture is the newest of a decode, a VideoProc output, a CPU upload and a write
+    /// through a writable export; each of those clears what the older ones left behind.
+    #[cfg(debug_assertions)]
+    fn violations(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        let mut rule = |broken: bool, what| if broken { v.push(what) };
+        rule(self.decode.is_some() as u8 + self.processed.is_some() as u8 + self.input.is_some() as u8 > 1, "more than one of decode, processed, input");
+        rule(self.copy.is_some() && self.decode.is_none(), "copy without decode");
+        rule(self.backing.is_some() && self.output.is_none(), "backing without output");
+        rule(self.writable && self.output.is_none(), "writable without output");
+        rule(self.writable && self.input.is_some(), "writable with a CPU picture");
+        rule(
+            self.import.is_some() && (self.decode.is_some() || self.input.is_some() || self.output.is_some() || self.writable),
+            "imported surface with a picture of its own",
+        );
+        v
+    }
 }
 struct Buffer {
     context: Option<u32>,
@@ -810,10 +828,26 @@ unsafe fn invoke_unlocked(ctx: VADriverContextP, f: impl FnOnce(&Mutex<Driver>) 
     if ctx.is_null() || (*ctx).pDriverData.is_null() {
         return VA_STATUS_ERROR_INVALID_DISPLAY as VAStatus;
     }
-    match catch_unwind(AssertUnwindSafe(|| f(&*((*ctx).pDriverData as *const Mutex<Driver>)))) {
+    let m = &*((*ctx).pDriverData as *const Mutex<Driver>);
+    let status = match catch_unwind(AssertUnwindSafe(|| f(m))) {
         Ok(Ok(())) => 0,
         Ok(Err(e)) => e,
         Err(_) => FAILED,
+    };
+    #[cfg(debug_assertions)]
+    check_surfaces(m);
+    status
+}
+/// Debug builds: aborts on a surface whose picture location is ambiguous, so a test cannot miss it.
+#[cfg(debug_assertions)]
+fn check_surfaces(m: &Mutex<Driver>) {
+    let Ok(d) = m.lock() else { return };
+    for (id, s) in &d.surfaces {
+        let broken = s.violations();
+        if !broken.is_empty() {
+            eprintln!("rustnv: surface {id} state invariant broken: {}", broken.join(", "));
+            std::process::abort();
+        }
     }
 }
 fn lock(m: &Mutex<Driver>) -> R<MutexGuard<'_, Driver>> {
@@ -1115,7 +1149,7 @@ callback!(begin_picture(ctx, id: u32, target: u32) |d| {
     let s = d.surfaces.get_mut(&target).unwrap();
     // A surface moving to another decoder must not keep its picture alive in the previous one.
     if let Some(previous) = s.worker.replace(worker.clone()).filter(|p| !Arc::ptr_eq(p, &worker)) { let _ = previous.tx.send(Command::Release(target)); }
-    s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.processed = None; s.output_dirty = true; Ok(())
+    s.owner = Some(id); s.extent = extent; s.decode = None; s.copy = None; s.processed = None; s.input = None; s.output_dirty = true; Ok(())
 });
 callback!(render_picture(ctx, id: u32, ids: *mut u32, n: i32) |d| {
     if d.vpp_contexts.contains_key(&id) { return vpp::render_picture(d, id, ids, n); }
@@ -1377,6 +1411,7 @@ callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, 
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
     // The copy engine converts neither depth nor chroma format: the image is the surface's own format.
     if image.format.fourcc != fourcc && !(fourcc == P010 && image.format.fourcc == P016) && !(fourcc == P012 && image.format.fourcc == P016) { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); }
+    if encode::get_input_image(&mut *lock(m)?, surface, (x as u32, y as u32, w, h), &image)? { return Ok(()); }
     if { let d = lock(m)?; let s = d.surface(surface)?; s.processed.is_some() || s.import.is_some() || s.writable } {
         return vpp::readback(m, surface, nvrm::video::vpp::Rect { x, y, width: w, height: h }, image.buf);
     }

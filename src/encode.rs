@@ -804,8 +804,42 @@ pub(super) fn put_image(
     input.fourcc = image.format.fourcc;
     input.pitch = image.pitches[0] as usize;
     input.offsets = image.offsets.map(|v| v as usize);
+    // The upload is now the picture: an earlier decode or VideoProc output no longer is, nor the
+    // decode's visible extent (the upload covers the whole surface).
     s.processed = None;
+    s.decode = None;
+    s.copy = None;
+    s.extent = (s.width, s.height);
     Ok(())
+}
+
+/// Copies the `rect` (x, y, w, h) of a surface's CPU picture (a vaPutImage upload or derived image)
+/// into `image`. `Ok(false)`: the surface holds no CPU picture.
+pub(super) fn get_input_image(d: &mut Driver, surface: u32, rect: (u32, u32, u32, u32), image: &VAImage) -> R<bool> {
+    let Some(input) = d.surface(surface)?.input.as_ref() else { return Ok(false) };
+    // The copy converts nothing: the image has the upload's own format.
+    if input.fourcc != image.format.fourcc {
+        return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus);
+    }
+    let from = super::packed_format(input.fourcc);
+    let (x, y, w, h) = rect;
+    let bps = from.bytes_per_sample() as usize;
+    let (column, row_bytes) = (x as usize * bps, w as usize * bps);
+    let input = input.clone();
+    let dest = d.buffers.get_mut(&image.buf).ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?;
+    if dest.mapped {
+        return Err(INVALID);
+    }
+    for plane in 0..from.planes() {
+        let rows = if plane == 0 || from.chroma_444 { y..y + h } else { y / 2..(y + h).div_ceil(2) };
+        for (i, row) in rows.clone().enumerate() {
+            let src = input.offsets[plane] + row as usize * input.pitch + column;
+            let dst = image.offsets[plane] as usize + i * image.pitches[plane] as usize;
+            let src = input.bytes.get(src..src + row_bytes).ok_or(INVALID)?;
+            dest.bytes.get_mut(dst..dst + row_bytes).ok_or(INVALID)?.copy_from_slice(src);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) unsafe fn query_surface_attributes(
