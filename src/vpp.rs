@@ -132,7 +132,10 @@ impl Worker {
                 while let Ok(command) = rx.recv() {
                     match command {
                         Command::Process { src, dst, key, op, wait, done } => {
-                            let result = wait.iter().try_for_each(|w| w.wait()).and_then(|()| run(&mut p, &src, &dst, key, &op));
+                            let result = wait.iter().try_for_each(|w| w.wait()).and_then(|()| match &src {
+                                Source::Dma(dma, _) => dma.wait_writers(),
+                                Source::Host(..) => Ok(()),
+                            }).and_then(|()| dst.wait_users()).and_then(|()| run(&mut p, &src, &dst, key, &op));
                             done.finish(result);
                         }
                         Command::Download { src, key, rect, dest, pitch, offsets, wait, reply } => {
@@ -483,6 +486,36 @@ pub(crate) fn end_picture(d: &mut Driver, id: u32) -> R {
     Ok(())
 }
 
+/// Copies the CPU picture of `id` into its exported backing and waits for it, so an export that
+/// grants read access shows it. Surfaces whose picture is already on the GPU are left alone.
+pub(crate) fn upload_input(d: &mut Driver, id: u32) -> R {
+    let s = d.surface(id)?;
+    if s.import.is_some() || s.decode.is_some() || s.processed.is_some() || s.writable {
+        return Ok(());
+    }
+    let Some(input) = s.input.as_ref() else { return Ok(()) };
+    let (w, h, fourcc) = (s.extent.0, s.extent.1, s.fourcc);
+    let copy = Input { bytes: input.bytes.clone(), fourcc: input.fourcc, pitch: input.pitch, offsets: input.offsets };
+    if !d.vpp_supported() {
+        log::log!("export: surface {id} holds a CPU picture and this GPU has no VideoProc to copy it into the export");
+        return Err(UNIMPL);
+    }
+    let rgb = Format::of_fourcc(fourcc).is_some_and(Format::rgb);
+    // SAFETY: plain C struct of integers; all-zero is "unspecified".
+    let side = Side { standard: VAProcColorStandardNone, properties: unsafe { std::mem::zeroed() } };
+    let (colour, _) = resolve(&side, rgb, h, &side, rgb, h)?;
+    let full = Rect { x: 0, y: 0, width: w, height: h };
+    let op = Operation { src_rect: full, dst_rect: full, src_colour: colour, dst_colour: colour, background: 0 };
+    let (dst, wait) = d.target_view(id)?;
+    let done = d.vpp_worker()?.process(Source::Host(copy, w, h), dst, id, op, wait);
+    done.wait()?;
+    let s = d.surfaces.get_mut(&id).unwrap();
+    s.processed = Some(done);
+    s.input = None;
+    s.output_dirty = false;
+    Ok(())
+}
+
 /// Reads the `rect` of a surface whose picture lives in a dma-buf (processed, or imported).
 pub(crate) fn readback(m: &std::sync::Mutex<Driver>, id: u32, rect: Rect, buffer: u32) -> R {
     let (dma, wait, fourcc) = {
@@ -495,6 +528,8 @@ pub(crate) fn readback(m: &std::sync::Mutex<Driver>, id: u32, rect: Rect, buffer
     for w in &wait {
         w.wait()?;
     }
+    // A client may still be rendering into an imported or writably exported buffer.
+    dma.wait_writers()?;
     let format = Format::of_fourcc(if fourcc == P016 { P012 } else { fourcc }).ok_or(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus)?;
     let (pitch, offsets, size) = format.packed(rect.width, rect.height);
     let mut guard = crate::lock(m)?;

@@ -399,20 +399,33 @@ struct DmaBufSyncFile {
     flags: u32,
     fd: i32,
 }
+const DMA_BUF_SYNC_READ: u32 = 1;
 const DMA_BUF_SYNC_WRITE: u32 = 2;
 /// _IOWR('b', 2, struct dma_buf_export_sync_file)
 const DMA_BUF_IOCTL_EXPORT_SYNC_FILE: u64 = 0xc008_6202;
 
-/// The fences a writer of `buf` has to wait for (every reader and writer), or None when the
-/// buffer is idle.
-fn dmabuf_fence(buf: &OwnedFd) -> Result<Option<OwnedFd>, String> {
-    let mut arg = DmaBufSyncFile { flags: DMA_BUF_SYNC_WRITE, fd: -1 };
+/// The implicit fences a user of `buf` with `access` (DMA_BUF_SYNC_READ / _WRITE) has to wait
+/// for, or None when there are none.
+fn dmabuf_sync_file(buf: &OwnedFd, access: u32) -> Result<Option<OwnedFd>, String> {
+    let mut arg = DmaBufSyncFile { flags: access, fd: -1 };
     // SAFETY: valid dma-buf fd and argument struct of the ioctl's layout.
     if unsafe { libc_ioctl(buf.as_raw_fd(), DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &mut arg) } != 0 {
         return Err(format!("DMA_BUF_IOCTL_EXPORT_SYNC_FILE: {}", std::io::Error::last_os_error()));
     }
     // SAFETY: the kernel returned a new sync_file fd that we now own.
     Ok((arg.fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(arg.fd) }))
+}
+/// The fences a writer of `buf` has to wait for (every reader and writer).
+fn dmabuf_fence(buf: &OwnedFd) -> Result<Option<OwnedFd>, String> {
+    dmabuf_sync_file(buf, DMA_BUF_SYNC_WRITE)
+}
+/// Waits for the writers fenced on `buf` (another device or API that rendered into it).
+pub fn wait_writers(buf: &OwnedFd) -> Result<(), String> {
+    dmabuf_sync_file(buf, DMA_BUF_SYNC_READ)?.map_or(Ok(()), |f| wait_fence(&f))
+}
+/// Waits for every reader and writer fenced on `buf`, before writing into it.
+pub fn wait_users(buf: &OwnedFd) -> Result<(), String> {
+    dmabuf_fence(buf)?.map_or(Ok(()), |f| wait_fence(&f))
 }
 
 extern "C" {

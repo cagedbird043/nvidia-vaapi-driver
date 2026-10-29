@@ -97,6 +97,9 @@ FFmpeg 经 `hwupload` 协商不了 H.264 444 和 HEVC Q416，这两种输入由�
 - 修饰符：线性，以及 NVIDIA 块线性（无压缩、Turing+ GOB、块高 ≤ 32 行，即 `0x0300000000606010`–`15` 一族）。其余修饰符返回 `UNSUPPORTED_MEMORY`。
 - 导入的 surface 不能做解码目标，也不能 `vaPutImage`；可再经 `vaExportSurfaceHandle` 导出。`vaDestroySurfaces` 释放 import 与映射，1000 次 import/export/destroy 循环 RSS 与 fd 数不增长。
 - 解码 surface 经 `vaExportSurfaceHandle` 导出时，拷贝入共享 backing 的操作在导出时排队，消费方需在导出后 `vaSyncSurface` 再读。
+- 带 `VA_EXPORT_SURFACE_WRITE_ONLY`（或 `READ_WRITE`）导出后，surface 的画面就在导出的 backing 里：之后编码、VideoProc 与读回都读客户端写进去的内容，
+  同一 surface 再次导出得到同一块存储，`vaPutImage` 返回 `VA_STATUS_ERROR_INVALID_SURFACE`。这是 Sunshine 的 VA-API 路径：导出一次，EGL 把两层当渲染目标，
+  每帧 GL 转换后直接送编码（回归：`tests/dmabuf_write.c`，由 `tests/encode.py` 的 `zero_copy` 调用）。编码前等 dma-buf 上的隐式写 fence。
 
 ### Chrome 与 DRM PRIME
 
@@ -115,7 +118,9 @@ C 版 nvidia-vaapi-driver 看似能在默认设置下工作，是因为它加载
 
 - 不支持 JPEG（见上）。VideoProc 没有滤镜，跨色域与 HDR → SDR 不做；Turing / Ampere / Hopper / Blackwell 的 `vpp` 内核随 RM 生成，但未在硬件上运行，这些 GPU 不报告 VideoProc。
 - BGRA 的 GPU 转换只在实测过的 Ada（compute class `0xc9c0`）上启用；其他架构的内核随 RM 生成、QMD 打包有单测，但不在硬件上运行，回退到 CPU 转换。
-- 等待在 CPU 侧：消费者等 copy engine 的 fence，NVDEC 与 copy engine 之间由 GPU timeline 串联；编码输入、导入的 dma-buf 不带 fence，外部生产者写完后由 CPU 侧同步保证。
+- 等待在 CPU 侧：消费者等 copy engine 的 fence，NVDEC 与 copy engine 之间由 GPU timeline 串联；编码输入只等 dma-buf 上的隐式写 fence。
+  NVIDIA 的 GL 渲染进 dma-buf 不挂 fence，驱动看不到它何时完成：可写导出时，若 GL 绘制在 `glFlush` 后迟迟未完成，
+  编码会读到旧画面或写了一半的画面。Sunshine 的 GL 转换是轻量绘制，实测（`DMABUF_WRITE_SPIN` ≤ 200）不出现，500 时几乎每帧出现；GPU 被其他负载占满时仍可能出现。
 - 不支持带压缩（c≠0）的块线性修饰符和 Turing 之前的 GOB 排布。
 - 编码为同步提交，单个 L0 参考、I/P 帧。
 - Chrome 需要 `--disable-gpu-sandbox` 与 `--render-node-override`。

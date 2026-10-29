@@ -205,6 +205,24 @@ impl Dma {
             chroma444: matches!(self.kind, Kind::Yuv444 | Kind::Q416),
         })
     }
+    /// Waits for the implicit write fences on every object: a client that rendered into the buffer
+    /// (EGL on an exported surface) may hand it over with the rendering still in flight.
+    pub fn wait_writers(&self) -> R {
+        self.wait_fences(crate::backend::wait_writers)
+    }
+    /// Waits for every implicit fence (readers and writers) before the driver writes the buffer.
+    pub fn wait_users(&self) -> R {
+        self.wait_fences(crate::backend::wait_users)
+    }
+    fn wait_fences(&self, wait: fn(&OwnedFd) -> Result<(), String>) -> R {
+        for object in &self.objects {
+            wait(object).map_err(|e| {
+                eprintln!("rustnv: {e}");
+                FAILED
+            })?;
+        }
+        Ok(())
+    }
     /// The VideoProc view of this buffer's samples.
     pub fn pixels(&self) -> vpp::Pixels {
         match self.kind {

@@ -2,7 +2,7 @@
 
 所有脚本都不安装或修改系统驱动：它们在子进程内用 `LIBVA_DRIVERS_PATH` / `LIBVA_DRIVER_NAME` 选择 rustnv。先 `cargo build --release`；脚本默认加载 `target/release/librustnv_drv_video.so`（`--driver` 可改），默认设备 `/dev/dri/renderD129`（`--device` 可改，用 `vainfo`/`ls /dev/dri` 确认 NVIDIA 的渲染节点）。
 
-脚本需要 Python 3、C 编译器、FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）、`vainfo`；对照 C 版时还需要另行安装的 C 版 `nvidia_drv_video.so`（与本驱动的安装名相同，二者不能同时装在 `/usr/lib/dri`；`tests/encode.py` 的 `--reference-library` 指向放有 C 版 `.so` 的目录，默认取系统驱动目录）。`tests/` 下的 `*.c` 是脚本自动编译的辅助程序（`va_dump.c`、`va_rt420.c`、`dmabuf_egl.c`、`dmabuf_import.c`、`dmabuf_export.c`）。
+脚本需要 Python 3、C 编译器、FFmpeg（libx264、libx265、libvpx、libsvtav1、libaom）、`vainfo`；对照 C 版时还需要另行安装的 C 版 `nvidia_drv_video.so`（与本驱动的安装名相同，二者不能同时装在 `/usr/lib/dri`；`tests/encode.py` 的 `--reference-library` 指向放有 C 版 `.so` 的目录，默认取系统驱动目录）。`tests/` 下的 `*.c` 是脚本自动编译的辅助程序（`va_dump.c`、`va_rt420.c`、`dmabuf_egl.c`、`dmabuf_import.c`、`dmabuf_export.c`、`dmabuf_write.c`）。
 
 ## 脚本
 
@@ -230,6 +230,7 @@ BGRA 外部 dma-buf 编码（H.264，300 帧，同一帧只上传一次，`IMP_S
 两种转换的输出码流逐字节一致。RM 的实机测试 `bgra_to_nv12_matches_cpu` 直接比对 NVENC 输入槽：极值、纯色、色度棋盘格、随机图（X 字节为垃圾值），1×1 到 1920×1080 的奇偶尺寸，线性（含带 padding 的 pitch）与块线性源，180 组逐字节一致。
 
 测试：`tests/encode.py` 的 `zero_copy` 编译 `tests/dmabuf_import.c`（Vulkan 分配外部 NV12/P010/444P/Q416/BGRA，线性与块线性）与 `tests/dmabuf_export.c`（libav VA-API 解码后导出再导入），逐字节对照同内容 `vaPutImage`、BGRA PSNR 门限、1000 次循环 RSS/fd。FFmpeg 的 VA-API 解码没有 Q416 像素格式（10-bit 4:4:4 硬解在 `vaBeginPicture` 即失败），Q416 解码 surface 的布局由 Q416 import 覆盖。RM 的实机测试 `cargo test --release --lib chroma_444_interleave -- --ignored` 直接比对 4:4:4 色度交错的 copy engine 输出与 CPU tiler。
+可写导出（Sunshine 路径）由 `tests/dmabuf_write.c` 覆盖：H.264 / HEVC / AV1 × NV12 / P010，FFmpeg VA-API 编码器的一个输入 surface 以 `WRITE_ONLY | SEPARATE_LAYERS` 导出一次，两层经 EGL 作渲染目标，每帧画一种新的纯色（只 `glFlush`）后送编码，软解后逐帧比对 Y / Cb / Cr 均值（±2.5）；另跑 1000 次 `READ_WRITE` 导出 / 销毁循环，RSS、fd 与显存不增长。`DMABUF_WRITE_SPIN=n` 让每次绘制在 GPU 上多跑 n 次循环，用来观察 NVIDIA GL 不挂 fence 时的竞争。
 
 ### Chrome 硬件编码（Chrome 156，Wayland 窗口，`--disable-gpu-sandbox`，临时 profile）
 

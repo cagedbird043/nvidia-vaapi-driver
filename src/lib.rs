@@ -571,6 +571,9 @@ struct Surface {
     import: Option<Arc<import::Dma>>,
     /// The GPU view of `output` (encoder, VideoProc), created on first use.
     backing: Option<Arc<import::Dma>>,
+    /// A client exported the surface for writing: from then on the picture lives in the backing,
+    /// and encoding, VideoProc and read-back read what the client wrote there.
+    writable: bool,
 }
 impl Surface {
     fn pending(&self) -> Vec<Arc<Completion>> {
@@ -721,7 +724,7 @@ impl Driver {
         if let Some(dma) = &s.import {
             return Ok(Some((dma.clone(), s.pending())));
         }
-        if s.decode.is_none() && s.processed.is_none() {
+        if s.decode.is_none() && s.processed.is_none() && !s.writable {
             return Ok(None);
         }
         self.ensure_output(id)?;
@@ -937,7 +940,7 @@ callback!(create_surfaces2(ctx, format: u32, w: u32, h: u32, surfaces: *mut u32,
         d.surfaces.insert(id, Surface {
             width: w, height: h, fourcc, owner: None, worker: None, extent: (w, h),
             decode: None, copy: None, output: None, output_dirty: false, input: None, processed: None,
-            import: import.clone(), backing: None,
+            import: import.clone(), backing: None, writable: false,
         });
         surfaces.add(i).write(id);
     }
@@ -1350,7 +1353,7 @@ callback!(create_image(ctx, format: *mut VAImageFormat, w: i32, h: i32, image: *
 callback_unlocked!(derive_image(ctx, surface: u32, image: *mut VAImage) |m| {
     if image.is_null() { return Err(INVALID); }
     if let Some(value) = encode::derive_input_image(&mut *lock(m)?, surface)? { return out(image, value); }
-    let (w, h, fourcc, on_gpu) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc, s.processed.is_some() || s.import.is_some()) };
+    let (w, h, fourcc, on_gpu) = { let d = lock(m)?; let s = d.surface(surface)?; (s.extent.0, s.extent.1, s.fourcc, s.processed.is_some() || s.import.is_some() || s.writable) };
     if on_gpu {
         let value = { let mut d = lock(m)?; let value = allocate_image(&mut d, w, h, fourcc)?; d.buffers.get_mut(&value.buf).unwrap().bytes = vec![0; value.data_size as usize]; value };
         let result = vpp::readback(m, surface, nvrm::video::vpp::Rect { x: 0, y: 0, width: w, height: h }, value.buf);
@@ -1374,7 +1377,7 @@ callback_unlocked!(get_image(ctx, surface: u32, x: i32, y: i32, w: u32, h: u32, 
     if x < 0 || y < 0 || x % 2 != 0 || y % 2 != 0 || w % 2 != 0 || h % 2 != 0 || w == 0 || h == 0 || image.width as u32 != w || image.height as u32 != h || (x as u32).checked_add(w).is_none_or(|v| v > cw) || (y as u32).checked_add(h).is_none_or(|v| v > ch) { return Err(INVALID); }
     // The copy engine converts neither depth nor chroma format: the image is the surface's own format.
     if image.format.fourcc != fourcc && !(fourcc == P010 && image.format.fourcc == P016) && !(fourcc == P012 && image.format.fourcc == P016) { return Err(VA_STATUS_ERROR_INVALID_IMAGE_FORMAT as VAStatus); }
-    if { let d = lock(m)?; let s = d.surface(surface)?; s.processed.is_some() || s.import.is_some() } {
+    if { let d = lock(m)?; let s = d.surface(surface)?; s.processed.is_some() || s.import.is_some() || s.writable } {
         return vpp::readback(m, surface, nvrm::video::vpp::Rect { x, y, width: w, height: h }, image.buf);
     }
     decoded(m, surface)?.wait()?;
@@ -1407,14 +1410,23 @@ callback!(query_surface_attrs(ctx, config: u32, attrs: *mut VASurfaceAttrib, n: 
 });
 callback!(export_surface(ctx, id: u32, mem_type: u32, flags: u32, descriptor: *mut c_void) |d| {
     if mem_type != VA_SURFACE_ATTRIB_MEM_TYPE_DRM_PRIME_2 { return Err(VA_STATUS_ERROR_UNSUPPORTED_MEMORY_TYPE as VAStatus); }
-    if flags & !(VA_EXPORT_SURFACE_READ_ONLY | VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_COMPOSED_LAYERS) != 0 || flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0 && flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
+    if flags & !(VA_EXPORT_SURFACE_READ_WRITE | VA_EXPORT_SURFACE_SEPARATE_LAYERS | VA_EXPORT_SURFACE_COMPOSED_LAYERS) != 0 || flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0 && flags & VA_EXPORT_SURFACE_SEPARATE_LAYERS != 0 { return Err(VA_STATUS_ERROR_FLAG_NOT_SUPPORTED as VAStatus); }
     if descriptor.is_null() { return Err(INVALID); }
+    // An imported surface's picture already is the client's buffer, written or not.
     if let Some(dma) = &d.surface(id)?.import { return out(descriptor.cast(), dma.export(flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0)?); }
     let format = Format::of_fourcc(d.surface(id)?.fourcc).ok_or(INVALID)?;
     let composed = flags & VA_EXPORT_SURFACE_COMPOSED_LAYERS != 0;
     let composed_format = format.composed_format();
     if composed && composed_format.is_none() { return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus); }
+    let readable_write = flags & VA_EXPORT_SURFACE_READ_WRITE == VA_EXPORT_SURFACE_READ_WRITE;
+    // READ_WRITE reads the current picture: a vaPutImage upload moves into the backing first.
+    if readable_write { vpp::upload_input(d, id)?; }
     let export = d.export_output(id)?;
+    if flags & VA_EXPORT_SURFACE_WRITE_ONLY != 0 {
+        let s = d.surfaces.get_mut(&id).unwrap();
+        s.writable = true;
+        s.input = None;
+    }
     let s = d.surface(id)?;
     let planes = format.planes();
     let mut desc: VADRMPRIMESurfaceDescriptor = zeroed(); desc.fourcc = format.descriptor_fourcc(); desc.width = s.extent.0; desc.height = s.extent.1; desc.num_objects = planes as u32;

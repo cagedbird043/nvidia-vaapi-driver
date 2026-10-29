@@ -494,6 +494,7 @@ fn ingest(e: &mut Encoder, key: u32, dma: &Dma, ready: &[Arc<Completion>]) -> R 
     for work in ready {
         work.wait()?;
     }
+    dma.wait_writers()?;
     let source = dma.source()?;
     gpu(match dma.kind {
         Kind::Bgra => e.load_dmabuf_bgra(u64::from(key), &source),
@@ -739,8 +740,8 @@ pub(super) unsafe fn create_image(
 
 pub(super) fn derive_input_image(d: &mut Driver, surface: u32) -> R<Option<VAImage>> {
     let s = d.surface(surface)?;
-    // Decoded, processed and imported pictures are read back into a copy.
-    if s.import.is_some() || s.decode.is_some() || s.processed.is_some() {
+    // Decoded, processed, imported and client-written pictures are read back into a copy.
+    if s.import.is_some() || s.decode.is_some() || s.processed.is_some() || s.writable {
         return Ok(None);
     }
     let (w, h, fourcc) = (s.width, s.height, s.fourcc);
@@ -770,7 +771,8 @@ pub(super) fn put_image(
         .ok_or(VA_STATUS_ERROR_INVALID_IMAGE as VAStatus)?;
     let buffer = d.buffer(image.buf)?;
     let s = d.surface(surface)?;
-    if s.import.is_some() {
+    // The picture of an imported or writably exported surface is the client's to write.
+    if s.import.is_some() || s.writable {
         return Err(VA_STATUS_ERROR_INVALID_SURFACE as VAStatus);
     }
     let (sx, sy, sw, sh) = src;

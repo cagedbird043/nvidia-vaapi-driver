@@ -10,7 +10,7 @@
 |---|---|
 | 解码 | H.264；HEVC（Main / Main10 / Main12 / Main444 / Main444_10 / Main444_12）；VP9 Profile 0 / 2；AV1 Profile 0（8 / 10-bit）；MPEG-2；MPEG-4 Part 2（SP / ASP）；VC-1；VP8 |
 | 编码 | H.264（Constrained Baseline / Main / High，含 4:4:4）；HEVC（Main / Main10 / Main444 / Main444_10）；AV1 Profile 0；CQP / CBR / VBR |
-| 导出 | `vaExportSurfaceHandle`（DRM PRIME 2，块线性修饰符），解码画面零 CPU 拷贝 |
+| 导出 | `vaExportSurfaceHandle`（DRM PRIME 2，块线性修饰符），解码画面零 CPU 拷贝；可写导出（`WRITE_ONLY` / `READ_WRITE`）后客户端渲染进去的画面直接作编码输入 |
 | 导入 | DRM PRIME / PRIME 2 的 dma-buf 作编码输入（NV12 / P010 / P012 / BGRA），经 GPU copy engine 送入 NVENC |
 | 视频处理 | `VAProfileNone` + `VAEntrypointVideoProc`（Ada）：双线性缩放、源裁剪、目的区域与背景色、NV12 / P010 / P012 / P016 / 444P / Q416 / RGB32 之间互转、BT.601 / 709 / 2020 矩阵与 full / limited range；无滤镜 |
 
@@ -90,6 +90,9 @@ GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264d
   'video/x-raw(memory:VAMemory),width=1280,height=720' ! fakesink
 ```
 
+**Sunshine**：`sunshine.conf` 里设 `encoder = vaapi`、`adapter_name = /dev/dri/renderD129`、`capture = kwin`（KDE；Sunshine 的 KMS 抓屏在 VA-API 下跳过 nvidia-drm 的卡）。
+Sunshine 带 file capabilities，libva 不读 `LIBVA_DRIVERS_PATH` / `LIBVA_DRIVER_NAME`，驱动要装在 `/usr/lib/dri/nvidia_drv_video.so`。
+
 ## 环境变量
 
 | 变量 | 作用 |
@@ -110,6 +113,7 @@ GST_VA_ALL_DRIVERS=1 gst-launch-1.0 filesrc location=in.mp4 ! parsebin ! vah264d
 - 4:2:2 解码、VP9 / AV1 4:4:4、AV1 12-bit、H.264 隔行与 FMO 等 NVDEC 不支持的情形会返回错误。
 - BGRA 输入的 GPU 色彩转换只在实测过的 Ada 上启用，其他架构回退到 CPU 转换。
 - 消费者在 CPU 上等待完成（解码与导出拷贝之间在 GPU 上串联），编码提交为同步。
+- 可写导出时，NVIDIA 的 GL 渲染不在 dma-buf 上挂 fence，驱动无法等它完成；GL 绘制在 `glFlush` 后迟迟未完成时，编码可能读到旧画面。Sunshine 的轻量转换实测正常。
 
 完整列表见 [docs/design.md](docs/design.md)。
 
@@ -159,7 +163,7 @@ A VA-API driver for NVIDIA GPUs written in Rust. It talks directly to the open N
 |---|---|
 | Decode | H.264; HEVC (Main / Main10 / Main12 / Main444 / Main444_10 / Main444_12); VP9 Profile 0 / 2; AV1 Profile 0 (8 / 10-bit); MPEG-2; MPEG-4 Part 2 (SP / ASP); VC-1; VP8 |
 | Encode | H.264 (Constrained Baseline / Main / High incl. 4:4:4); HEVC (Main / Main10 / Main444 / Main444_10); AV1 Profile 0; CQP / CBR / VBR |
-| Export | `vaExportSurfaceHandle` (DRM PRIME 2, block-linear modifiers), no CPU copy for decoded frames |
+| Export | `vaExportSurfaceHandle` (DRM PRIME 2, block-linear modifiers), no CPU copy for decoded frames; after a writable export (`WRITE_ONLY` / `READ_WRITE`) what the client renders into it is the encoder input |
 | Import | DRM PRIME / PRIME 2 dma-bufs as encoder input (NV12 / P010 / P012 / BGRA), fed to NVENC by the GPU copy engine |
 | Video processing | `VAProfileNone` + `VAEntrypointVideoProc` (Ada): bilinear scaling, source crop, output region and background colour, conversion between NV12 / P010 / P012 / P016 / 444P / Q416 / RGB32, BT.601 / 709 / 2020 matrices, full / limited range; no filters |
 
@@ -208,6 +212,7 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 - **Chrome / Chromium**: the GPU sandbox must be disabled and the NVIDIA render node given explicitly; see the command in the Chinese section above.
 - **ffmpeg**: `-hwaccel vaapi -hwaccel_device /dev/dri/renderD129 -hwaccel_output_format vaapi` for decoding; `-init_hw_device vaapi=va:/dev/dri/renderD129 -filter_hw_device va … -vf format=nv12,hwupload -c:v h264_vaapi` for encoding; `scale_vaapi` for scaling and format conversion.
 - **GStreamer**: set `GST_VA_ALL_DRIVERS=1` so the `va` plugin registers elements for this driver; `vapostproc` scales and converts.
+- **Sunshine**: `encoder = vaapi`, `adapter_name = /dev/dri/renderD129` and `capture = kwin` on KDE (Sunshine's KMS capture skips nvidia-drm cards under VA-API). Sunshine has file capabilities, so libva ignores `LIBVA_DRIVERS_PATH` / `LIBVA_DRIVER_NAME`: the driver must be installed as `/usr/lib/dri/nvidia_drv_video.so`.
 
 ## Environment variables
 
@@ -227,6 +232,7 @@ Check with `vainfo --display drm --device /dev/dri/renderD129` first (use your N
 - Formats NVDEC cannot decode (4:2:2, VP9 / AV1 4:4:4, AV1 12-bit, interlaced H.264, FMO, …) return errors.
 - GPU colour conversion of BGRA encoder input is enabled only on the tested Ada GPU; other architectures fall back to the CPU.
 - Consumers wait for completion on the CPU (the export copy is ordered after the decode on the GPU); encode submission is synchronous.
+- With a writable export, NVIDIA's GL puts no fence on the dma-buf it renders into, so the driver cannot wait for it; a draw still running long after `glFlush` can be encoded stale. Sunshine's light conversion tested fine.
 
 ## Performance vs. the C driver
 

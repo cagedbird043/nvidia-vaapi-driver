@@ -308,7 +308,8 @@ def build_tools(directory):
     flags = lambda *libs: subprocess.run(['pkg-config', '--cflags', '--libs', *libs], stdout=subprocess.PIPE, text=True, check=True).stdout.split()
     tools = {}
     for name, libs, extra in [('dmabuf_import', ['libva', 'libva-drm', 'libdrm'], ['-ldl']),
-                              ('dmabuf_export', ['libva', 'libavcodec', 'libavformat', 'libavutil'], [])]:
+                              ('dmabuf_export', ['libva', 'libavcodec', 'libavformat', 'libavutil'], []),
+                              ('dmabuf_write', ['egl', 'glesv2', 'gbm', 'libva', 'libavcodec', 'libavutil'], [])]:
         tools[name] = directory / name
         run(['gcc', '-O1', '-o', str(tools[name]), str(tests / f'{name}.c'), *flags(*libs), *extra])
     return tools
@@ -431,6 +432,15 @@ def zero_copy(args, env, directory):
         return fn
     for codec, fmt, src in [('h264', 'nv12', 'linear'), ('h264', 'nv12', 'bl'), ('hevc', 'p010', 'bl'), ('h264', 'bgra', 'linear')]:
         check(f'import-cycles-{codec}-{fmt}-{src}', cycles(codec, fmt, src))
+
+    def written(encoder, fmt):
+        """Sunshine's path: one surface exported writable once, EGL draws each frame into it, the encoder reads it back."""
+        def fn():
+            text = run([str(tools['dmabuf_write']), node, encoder, fmt, '120'], {**env, 'DMABUF_WRITE_CYCLES': '1000'}).stdout
+            return dict(result=text.strip().splitlines())
+        return fn
+    for encoder, fmt in [('h264_vaapi', 'NV12'), ('hevc_vaapi', 'NV12'), ('hevc_vaapi', 'P010'), ('av1_vaapi', 'NV12'), ('av1_vaapi', 'P010')]:
+        check(f'export-writable-{encoder}-{fmt}', written(encoder, fmt))
     return rows
 
 
