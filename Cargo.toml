@@ -1,6 +1,6 @@
 [package]
 name = "rustnv-vaapi"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 publish = false
 build = "build.rs"
@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 # Local development overrides this with a path [patch] in .cargo/config.toml (not committed).
-nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "5fcba81e78fa95e03fc816f3adc030e2f887a003", default-features = false }
+nvrm = { package = "nv-bionic-native", git = "https://github.com/cagedbird043/nvrm", rev = "cb3633b2e73fce16d1c2631f181f64f0d42e9fc1", default-features = false }
 
 [build-dependencies]
 bindgen = "0.72"
